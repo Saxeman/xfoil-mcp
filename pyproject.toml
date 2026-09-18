@@ -2,9 +2,20 @@
 name = "xfoil-mcp"
 version = "0.1.0"
 requires-python = ">=3.10"
-dependencies = ["fastmcp"]
+dependencies = ["pydantic>=2"]
+
+[tool.setuptools.packages.find]
+include = ["xfoil_mcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "docker: needs Docker and the built images",
+]
 
 [project.optional-dependencies]
+control = ["fastmcp"]
+sandbox = ["numpy", "scipy"]
 dev = ["pytest"]
 
 [build-system]

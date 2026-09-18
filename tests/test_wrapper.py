@@ -20,9 +20,14 @@ fast.
 
 from __future__ import annotations
 
+import shutil
+
 import pytest
 
 from xfoil_mcp.wrapper import run_polar
+
+pytestmark = pytest.mark.skipif(shutil.which("xfoil") is None,
+                                reason="needs xfoil; run inside the worker container")
 
 CLEAN = dict(airfoil="2412", reynolds=1e6, alpha_start=0, alpha_end=10, alpha_step=1)
 CASCADE = dict(airfoil="2412", reynolds=1e6, alpha_start=0, alpha_end=20,
