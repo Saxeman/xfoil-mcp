@@ -193,7 +193,7 @@ def _build_commands(
             f"MACH {mach}",
             "PACC",
             polar_path,      # polar save file
-            "",              # decline the dump file
+            "",              # decline the dump file, BUG: this will generate a dump file anyways
             f"ASEQ {alpha_start} {alpha_end} {alpha_step}",
             "PACC",          # stop accumulating, flushes the file
             "",              # leave OPER
