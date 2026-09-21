@@ -83,13 +83,21 @@ def test_run_polar_builds_a_valid_case_and_returns_summary(monkeypatch):
     assert out["best_ld"] == 93.0
     assert "data" not in out and "points" not in out
 
-
 def test_run_polar_rejects_invalid_arguments_before_dispatch(monkeypatch):
     called = []
     monkeypatch.setattr(server.dispatch, "run_case", lambda c, timeout=180.0: called.append(c))
-    with pytest.raises(Exception):
-        call("run_polar", airfoil="24a2", reynolds=1e6)
+    out = call("run_polar", airfoil="24a2", reynolds=1e6)
     assert called == []
+    assert out["status"] == "error"
+    assert out["failure_kind"] == "input"
+    assert any("naca" in e for e in out["errors"])
+
+def test_run_polar_reports_all_input_errors_at_once(monkeypatch):
+    monkeypatch.setattr(server.dispatch, "run_case", lambda c, timeout=180.0: pytest.fail("dispatched"))
+    out = call("run_polar", airfoil="24a2", reynolds=-1)
+    assert out["failure_kind"] == "input"
+    assert any("naca" in e for e in out["errors"])
+    assert any("reynolds" in e for e in out["errors"])
 
 
 # --- dry_run_campaign ------------------------------------------------------

@@ -13,6 +13,7 @@ import logging
 import sys
 
 from fastmcp import FastMCP
+from pydantic import ValidationError
 
 from xfoil_mcp import dispatch, harness
 from xfoil_mcp.schema import Case, Conditions, Geometry
@@ -63,13 +64,21 @@ def run_polar(
     start closer to the failed region, or accept the gap. Consecutive
     failures near the top of the sweep usually mean stall.
     """
-    case = Case(
-        geometry=Geometry(naca=airfoil),
-        conditions=Conditions(
-            reynolds=reynolds, alpha_start=alpha_start, alpha_end=alpha_end,
-            alpha_step=alpha_step, n_crit=n_crit, max_iter=max_iter,
-        ),
-    )
+    try:
+        case = Case.model_validate({
+            "geometry": {"naca": airfoil},
+            "conditions": {
+                "reynolds": reynolds, "alpha_start": alpha_start, "alpha_end": alpha_end,
+                "alpha_step": alpha_step, "n_crit": n_crit, "max_iter": max_iter,
+            },
+        })
+    except ValidationError as exc:
+        return {
+            "status": "error",
+            "failure_kind": "input",
+            "retry_could_help": False,
+            "errors": [f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()],
+        }
     result = dispatch.run_case(case)
     return {
         "content_hash": case.content_hash(),
