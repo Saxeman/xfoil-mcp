@@ -60,8 +60,10 @@ def run_case(case: Case) -> CaseResult:
     started = time.monotonic()
 
     if case.geometry.flap is not None:
+        # TODO: IMPLEMENT ME
         return _not_implemented(case, "flap deflection", started)
     if set(case.outputs) - {"forces"}:
+        # TODO: IMPLEMENT ME
         return _not_implemented(case, f"outputs {case.outputs}", started)
 
     c = case.conditions

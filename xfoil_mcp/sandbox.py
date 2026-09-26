@@ -46,52 +46,56 @@ class SandboxOutcome:
     def ok(self) -> bool:
         return not self.killed and not self.errors and not self.rejected
 
-
 def run_campaign_source(source: str, timeout: float = 30.0) -> SandboxOutcome:
     name = f"xfoil-sandbox-{uuid.uuid4().hex[:12]}"
     cmd = ["docker", "run", "--rm", "-i", "--name", name, *SANDBOX_FLAGS, SANDBOX_IMAGE]
     started = time.monotonic()
 
     try:
-        proc = subprocess.run(cmd, input=source, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # Killing the client does not kill the container. Do it explicitly.
-        subprocess.run(["docker", "kill", name], capture_output=True, timeout=10)
-        return SandboxOutcome(
-            killed=True,
-            errors=[f"campaign exceeded {timeout}s and was killed"],
-            wall_seconds=time.monotonic() - started,
-        )
-    except FileNotFoundError:
-        return SandboxOutcome(errors=["docker not found on host"])
-
-    wall = time.monotonic() - started
-
-    if proc.returncode != 0:
-        # OOM kill, pid-limit kill, and similar land here with a non-zero
-        # exit and usually nothing useful on stdout.
-        return SandboxOutcome(
-            killed=True,
-            errors=[f"sandbox exited {proc.returncode}: {proc.stderr.strip()[-500:]}"],
-            wall_seconds=wall,
-        )
-
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return SandboxOutcome(
-            errors=[f"sandbox output was not JSON: {proc.stdout[:200]!r}"],
-            wall_seconds=wall,
-        )
-
-    outcome = SandboxOutcome(errors=list(payload.get("errors", [])), wall_seconds=wall)
-
-    # Re-validate on the host. The sandbox already validated on construction,
-    # but the sandbox is where the untrusted code ran.
-    for i, raw in enumerate(payload.get("cases", [])):
         try:
-            outcome.cases.append(Case.model_validate(raw))
-        except Exception as exc:
-            outcome.rejected.append(f"case {i}: {exc}")
+            proc = subprocess.run(
+                cmd, input=source, capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return SandboxOutcome(
+                killed=True,
+                errors=[f"campaign exceeded {timeout}s and was killed"],
+                wall_seconds=time.monotonic() - started,
+            )
+        except FileNotFoundError:
+            return SandboxOutcome(errors=["docker not found on host"])
 
-    return outcome
+        wall = time.monotonic() - started
+
+        if proc.returncode != 0:
+            return SandboxOutcome(
+                killed=True,
+                errors=[f"sandbox exited {proc.returncode}: {proc.stderr.strip()[-500:]}"],
+                wall_seconds=wall,
+            )
+
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return SandboxOutcome(
+                errors=[f"sandbox output was not JSON: {proc.stdout[:200]!r}"],
+                wall_seconds=wall,
+            )
+
+        outcome = SandboxOutcome(errors=list(payload.get("errors", [])), wall_seconds=wall)
+
+        for i, raw in enumerate(payload.get("cases", [])):
+            try:
+                outcome.cases.append(Case.model_validate(raw))
+            except Exception as exc:
+                outcome.rejected.append(f"case {i}: {exc}")
+
+        return outcome
+
+    finally:
+        # Every path out of this function ends here, including the early
+        # returns above. --rm handles a clean exit; this handles the rest.
+        rm = subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True, timeout=15)
+        if rm.returncode != 0 and "No such container" not in rm.stderr:
+            logging.getLogger(__name__).warning("failed to remove %s: %s", name, rm.stderr.strip())
+
