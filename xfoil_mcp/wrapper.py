@@ -48,6 +48,9 @@ _MRCHDU_FAILURE = re.compile(r"MRCH(DU|UE):\s+Convergence failed")
 _ITER_LIMIT_ECHO = re.compile(r"Current iteration limit:\s+(\d+)")
 _DISPLAY_ABORT = re.compile(r"Cannot open display")
 
+# Meta info about .bl file outputs
+BL_SURFACE_COLS = 12
+BL_WAKE_COLS = 8
 
 class XfoilError(Exception):
     """Raised only for failures that make the whole run meaningless.
@@ -73,6 +76,35 @@ class PolarPoint:
     def ld(self) -> float:
         return self.cl / self.cd if self.cd else float("nan")
 
+@dataclass
+class BoundaryLayer:
+    """Boundary-layer state along the surface for one converged alpha.
+
+    Rows run upper trailing edge -> leading edge -> lower trailing edge,
+    then the wake. Ue is signed along s, so it is negative on the lower
+    surface. Wake rows have Cf = 0 by definition: there is no wall.
+    """
+
+    alpha: float
+    s: list[float]          # arc length from upper trailing edge
+    x: list[float]
+    y: list[float]
+    ue: list[float]         # edge velocity / freestream, signed along s
+    dstar: list[float]      # displacement thickness
+    theta: list[float]      # momentum thickness
+    cf: list[float]         # skin friction coefficient
+    h: list[float]          # shape factor, dstar / theta
+    n_surface: int          # rows before the wake
+
+    @property
+    def le_index(self) -> int:
+        """Geometric leading edge: minimum x on the surface.
+
+        Not the stagnation point, which sits slightly on the lower surface
+        at positive alpha, where Ue changes sign.
+        """
+        xs = self.x[: self.n_surface]
+        return min(range(len(xs)), key=xs.__getitem__)
 
 @dataclass
 class PolarResult:
@@ -243,6 +275,50 @@ def _parse_polar_file(path: Path) -> list[PolarPoint]:
         )
     return points
 
+
+
+def _parse_bl_file(path: Path, alpha: float) -> BoundaryLayer | None:
+    """Parse a DUMP file into a BoundaryLayer.
+
+    The header names 14 columns but surface rows carry 12 values and wake
+    rows 8. Row length is what distinguishes them. The first 8 columns
+    (s x y Ue Dstar Theta Cf H) are common to both and are all we keep.
+
+    Any row with an unexpected length rejects the whole file: if XFOIL's
+    format changes, fail loudly rather than parse garbage.
+    """
+    if not path.exists():
+        return None
+
+    surface: list[list[float]] = []
+    wake: list[list[float]] = []
+    for line in path.read_text(errors="replace").splitlines():
+        fields = line.split()
+        if not fields or fields[0].startswith("#"):
+            continue
+        try:
+            values = [float(f) for f in fields]
+        except ValueError:
+            return None
+
+        if len(values) == BL_SURFACE_COLS:
+            if wake:
+                return None             # surface row after the wake began
+            surface.append(values[:8])
+        elif len(values) == BL_WAKE_COLS:
+            wake.append(values)
+        else:
+            return None
+
+    if not surface:
+        return None
+
+    s, x, y, ue, dstar, theta, cf, h = (list(col) for col in zip(*(surface + wake)))
+    return BoundaryLayer(
+        alpha=alpha, s=s, x=x, y=y, ue=ue,
+        dstar=dstar, theta=theta, cf=cf, h=h,
+        n_surface=len(surface),
+    )
 
 def _scan_stdout(stdout: str, requested_max_iter: int) -> list[str]:
     """Pull failure evidence out of stdout.
