@@ -148,3 +148,30 @@ def test_fine_step_reports_only_genuine_failures():
     result = run_polar("2412", 1e6, 0, 0.5, 0.0625)
     viscal = result.stdout.count("VISCAL:  Convergence failed")
     assert len(result.failed_alphas) == viscal
+
+# --- boundary-layer output --------------------------------------------------
+
+def test_forces_only_run_has_no_boundary_layer():
+    assert run_polar("2412", 1e6, 0, 4, 2).bl == {}
+
+
+def test_bl_attached_only_for_converged_alphas():
+    result = run_polar("2412", 1e6, 0, 20, 1, max_iter=5, outputs=("forces", "bl"))
+    assert result.status == "partial"
+    converged = set(result.requested_alphas) - set(result.failed_alphas)
+    assert set(result.bl) == converged
+
+
+def test_bl_from_a_real_run_matches_the_fixture_layout():
+    layer = run_polar("2412", 1e6, 0, 4, 4, outputs=("bl",)).bl[4.0]
+    assert layer.n_surface == 160
+    assert layer.s[layer.le_index] == pytest.approx(1.0272, abs=1e-4)
+
+
+def test_per_alpha_solves_give_the_same_forces_as_aseq():
+    """Step 3 claimed ALFA-per-point warm-starts the way ASEQ does. This checks it."""
+    aseq = run_polar("2412", 1e6, 0, 6, 2)
+    alfa = run_polar("2412", 1e6, 0, 6, 2, outputs=("forces", "bl"))
+    for a, b in zip(aseq.points, alfa.points):
+        assert a.cl == pytest.approx(b.cl, abs=2e-4)
+        assert a.cd == pytest.approx(b.cd, abs=2e-5)

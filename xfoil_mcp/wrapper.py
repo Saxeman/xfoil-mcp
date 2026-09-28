@@ -127,6 +127,7 @@ class PolarResult:
     runtime_seconds: float = 0.0
     returncode: int | None = None
     stdout: str = ""
+    bl: dict[float, BoundaryLayer] = field(default_factory=dict)   # converged alphas only
 
     @property
     def converged_count(self) -> int:
@@ -359,6 +360,29 @@ def _match_alphas(requested: list[float], points: list[PolarPoint]) -> dict[floa
     tol = POLAR_ALPHA_RESOLUTION
     return {a: p for a in requested for p in points if abs(p.alpha - a) <= tol}
 
+def _collect_bl(
+    workdir: Path, requested: list[float], matched: dict[float, PolarPoint]
+) -> tuple[dict[float, BoundaryLayer], list[str]]:
+    """Parse the DUMP file for each converged alpha; ignore the rest.
+
+    XFOIL writes a complete, well-formed DUMP file for every point, including
+    points that did not converge, and a converged file can legitimately hold
+    negative Cf. Neither can be judged by looking, so the polar decides: a
+    file is read only if its alpha appears in the polar. A converged alpha
+    whose file is missing or unreadable is reported, not silently skipped.
+    """
+    bl: dict[float, BoundaryLayer] = {}
+    warnings: list[str] = []
+    for i, alpha in enumerate(requested):
+        if alpha not in matched:
+            continue
+        layer = _parse_bl_file(workdir / _field_filename("bl", i), alpha)
+        if layer is None:
+            warnings.append(f"bl dump missing or unreadable for converged alpha {alpha}")
+        else:
+            bl[alpha] = layer
+    return bl, warnings
+
 def _scan_stdout(stdout: str, requested_max_iter: int) -> list[str]:
     """Pull failure evidence out of stdout.
 
@@ -410,6 +434,7 @@ def run_polar(
     n_crit: float = 9.0,
     max_iter: int = 100,
     timeout: float = 120.0,
+    outputs: tuple[str, ...] = ("forces",),
 ) -> PolarResult:
     """Run a viscous alpha sweep and return a validated result.
 
@@ -428,6 +453,7 @@ def run_polar(
         commands = _build_commands(
             airfoil, reynolds, mach, n_crit, max_iter,
             alpha_start, alpha_end, alpha_step, polar_path.name,
+            outputs=outputs,
         )
 
         started = time.monotonic()
@@ -453,10 +479,16 @@ def run_polar(
         runtime = time.monotonic() - started
         stdout = proc.stdout or ""
         points = _parse_polar_file(polar_path)
+        # Match and read dump files here: the directory is deleted when
+        # this block ends.
+        matched = _match_alphas(requested, points)
+        bl, bl_warnings = (
+            _collect_bl(Path(workdir), requested, matched) if "bl" in outputs else ({}, [])
+        )
 
-    matched = _match_alphas(requested, points)
     failed = [a for a in requested if a not in matched]
     warnings = _scan_stdout(stdout, max_iter)
+    warnings += bl_warnings
 
     if not points:
         warnings.append("no converged points; check warnings above")
@@ -474,6 +506,7 @@ def run_polar(
         runtime_seconds=runtime,
         returncode=proc.returncode,
         stdout=stdout,
+        bl=bl,
     )
 
 
