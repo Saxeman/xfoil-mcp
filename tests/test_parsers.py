@@ -8,10 +8,13 @@ from pathlib import Path
 import pytest
 import shutil
 
-from xfoil_mcp.wrapper import BoundaryLayer, PolarPoint, _collect_bl, _parse_bl_file
+from xfoil_mcp.wrapper import (
+    BoundaryLayer, CpDistribution, PolarPoint, _collect_bl, _parse_bl_file, _parse_cp_file,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 BL_A4 = FIXTURES / "bl_2412_re1e6_a4.txt"
+CP_A4 = FIXTURES / "cp_2412_re1e6_a4.txt"
 
 
 @pytest.fixture
@@ -85,3 +88,44 @@ def test_files_are_matched_to_alphas_by_position(tmp_path):
     bl, warnings = _collect_bl(tmp_path, [2.0, 4.0], {2.0: pt(2.0), 4.0: pt(4.0)})
     assert set(bl) == {4.0}
     assert "2.0" in warnings[0]          # bl_000 is missing
+
+# --- pressure distribution --------------------------------------------------
+
+@pytest.fixture
+def cp() -> CpDistribution:
+    parsed = _parse_cp_file(CP_A4, alpha=4.0)
+    assert parsed is not None
+    return parsed
+
+
+def test_cp_has_one_row_per_surface_node(cp, layer):
+    assert len(cp.x) == layer.n_surface == 160
+
+
+def test_cp_nodes_are_the_bl_surface_nodes(cp, layer):
+    """Same nodes, same order. That's what lets position tell upper from
+    lower when the Cp file has no y column."""
+    assert cp.x == pytest.approx(layer.x[: layer.n_surface], abs=1e-5)
+
+
+def test_cp_is_one_minus_ue_squared(cp, layer):
+    """Bernoulli at Mach 0: Cp = 1 - (Ue/V_inf)^2. The two files are two
+    views of one solution; if this fails, one of the parsers is wrong."""
+    for c, ue in zip(cp.cp, layer.ue[: layer.n_surface]):
+        assert c == pytest.approx(1 - ue**2, abs=1e-4)
+
+
+def test_peak_cp_is_the_node_nearest_stagnation(cp):
+    i = max(range(len(cp.cp)), key=cp.cp.__getitem__)
+    assert cp.x[i] == pytest.approx(0.00334, abs=1e-5)
+    assert cp.cp[i] < 1.0        # the true stagnation point falls between nodes
+
+
+def test_cp_rejects_a_row_with_the_wrong_column_count(tmp_path):
+    bad = tmp_path / "bad.txt"
+    bad.write_text("#  x  Cp\n 1.0 0.17 0.5\n")
+    assert _parse_cp_file(bad, alpha=0.0) is None
+
+
+def test_cp_missing_file_returns_none(tmp_path):
+    assert _parse_cp_file(tmp_path / "nope.txt", alpha=0.0) is None

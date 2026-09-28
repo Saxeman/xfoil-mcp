@@ -110,6 +110,25 @@ class BoundaryLayer:
         return min(range(len(xs)), key=xs.__getitem__)
 
 @dataclass
+class CpDistribution:
+    """Surface pressure coefficient for one converged alpha.
+
+    Same nodes in the same order as the surface rows of the matching
+    BoundaryLayer: upper trailing edge -> leading edge -> lower trailing
+    edge. No y column and no wake, so position is what tells upper from
+    lower. At Mach 0, cp == 1 - ue**2 node for node.
+    """
+
+    alpha: float
+    x: list[float]
+    cp: list[float]
+
+    @property
+    def le_index(self) -> int:
+        """Geometric leading edge: minimum x. Splits upper from lower."""
+        return min(range(len(self.x)), key=self.x.__getitem__)
+
+@dataclass
 class PolarResult:
     """Everything a caller needs to judge whether to trust these numbers."""
 
@@ -347,6 +366,34 @@ def _parse_bl_file(path: Path, alpha: float) -> BoundaryLayer | None:
         dstar=dstar, theta=theta, cf=cf, h=h,
         n_surface=len(surface),
     )
+
+def _parse_cp_file(path: Path, alpha: float) -> CpDistribution | None:
+    """Parse a CPWR file: two columns, x and Cp, surface nodes only.
+
+    Any row that is not exactly two numbers rejects the whole file, for the
+    same reason as the DUMP parser: a format change should fail loudly.
+    """
+    if not path.exists():
+        return None
+
+    xs: list[float] = []
+    cps: list[float] = []
+    for line in path.read_text(errors="replace").splitlines():
+        fields = line.split()
+        if not fields or fields[0].startswith("#"):
+            continue
+        if len(fields) != 2:
+            return None
+        try:
+            x, cp = float(fields[0]), float(fields[1])
+        except ValueError:
+            return None
+        xs.append(x)
+        cps.append(cp)
+
+    if not xs:
+        return None
+    return CpDistribution(alpha=alpha, x=xs, cp=cps)
 
 def _match_alphas(requested: list[float], points: list[PolarPoint]) -> dict[float, PolarPoint]:
     """Map each requested alpha to the polar row that reports it, if any.
