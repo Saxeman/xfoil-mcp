@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(shutil.which("xfoil") is None,
 
 CLEAN = dict(airfoil="2412", reynolds=1e6, alpha_start=0, alpha_end=10, alpha_step=1)
 CASCADE = dict(airfoil="2412", reynolds=1e6, alpha_start=0, alpha_end=20,
-               alpha_step=1, max_iter=5)
+               alpha_step=1, max_iter=10)
 
 
 @pytest.fixture(scope="module")
@@ -168,10 +168,30 @@ def test_bl_from_a_real_run_matches_the_fixture_layout():
     assert layer.s[layer.le_index] == pytest.approx(1.0272, abs=1e-4)
 
 
-def test_per_alpha_solves_give_the_same_forces_as_aseq():
+def test_requesting_fields_does_not_change_forces():
     """Step 3 claimed ALFA-per-point warm-starts the way ASEQ does. This checks it."""
     aseq = run_polar("2412", 1e6, 0, 6, 2)
     alfa = run_polar("2412", 1e6, 0, 6, 2, outputs=("forces", "bl"))
     for a, b in zip(aseq.points, alfa.points):
         assert a.cl == pytest.approx(b.cl, abs=2e-4)
         assert a.cd == pytest.approx(b.cd, abs=2e-5)
+
+def test_requesting_fields_does_not_change_which_points_converge():
+    plain = run_polar("2412", 1e6, 0, 20, 1, max_iter=10)
+    fields = run_polar("2412", 1e6, 0, 20, 1, max_iter=10, outputs=("bl", "cp"))
+    assert fields.failed_alphas == plain.failed_alphas
+
+def test_cp_attached_only_for_converged_alphas():
+    result = run_polar("2412", 1e6, 0, 20, 1, max_iter=5, outputs=("cp",))
+    converged = set(result.requested_alphas) - set(result.failed_alphas)
+    assert set(result.cp) == converged
+
+
+def test_bl_and_cp_from_one_run_are_the_same_solution():
+    """Bernoulli across two files written by the same run. If collection
+    paired a Cp file with the wrong alpha, this breaks."""
+    result = run_polar("2412", 1e6, 0, 6, 2, outputs=("bl", "cp"))
+    for alpha in result.cp:
+        layer, cp = result.bl[alpha], result.cp[alpha]
+        for c, ue in zip(cp.cp, layer.ue[: layer.n_surface]):
+            assert c == pytest.approx(1 - ue**2, abs=5e-5)

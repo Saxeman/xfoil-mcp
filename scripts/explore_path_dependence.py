@@ -84,9 +84,7 @@ def a_failure_degrades_its_successors() -> None:
     print(f"  grouped into runs: {result.failure_runs}")
     for run in result.failure_runs:
         if len(run) > 1:
-            print(f"  -> {run} is consecutive, consistent with a cascade "
-                  "rather than {len(run)} independent hard points")
-
+            print(f"  -> {run} is consecutive, consistent with a cascade rather than {len(run)} independent hard points")
 
 def retrying_identically_is_pointless() -> None:
     """Determinism means a plain retry cannot help. Worth demonstrating,

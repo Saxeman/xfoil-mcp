@@ -18,10 +18,10 @@ def script(outputs=("forces",), start=0, end=4, step=2) -> list[str]:
     ).split("\n")
 
 
-def test_forces_only_uses_one_aseq_sweep():
+def test_forces_only_solves_each_alpha_without_writing_files():
     lines = script()
-    assert "ASEQ 0 4 2" in lines
-    assert not any(l.startswith(("ALFA", "DUMP")) for l in lines)
+    assert not any(l.startswith(("ASEQ", "DUMP", "CPWR")) for l in lines)
+    assert [l for l in lines if l.startswith("ALFA")] == ["ALFA 0.0", "ALFA 2.0", "ALFA 4.0"]
 
 
 def test_bl_output_solves_each_alpha_individually():
@@ -42,8 +42,9 @@ def test_dump_files_are_named_by_position_not_alpha():
     dumps = [l.split()[1] for l in lines if l.startswith("DUMP")]
     assert dumps == ["bl_000.txt", "bl_001.txt", "bl_002.txt", "bl_003.txt", "bl_004.txt"]
 
-
-@pytest.mark.parametrize("outputs", [("forces",), ("forces", "bl")])
+@pytest.mark.parametrize("outputs", [
+    ("forces",), ("forces", "bl"), ("cp",), ("forces", "bl", "cp"),
+])
 def test_script_frame_is_unchanged(outputs):
     """The lines around the sweep must be identical in both modes: graphics
     off first, polar accumulation opened with its two prompt answers, and
@@ -54,3 +55,18 @@ def test_script_frame_is_unchanged(outputs):
     k = lines.index("PACC")
     assert lines[k + 1] == "polar.txt" and lines[k + 2] == ""
     assert lines[-4:] == ["PACC", "", "QUIT", ""]
+
+def test_cp_output_writes_cpwr_after_each_alfa():
+    lines = script(outputs=("cp",))
+    assert not any(l.startswith(("ASEQ", "DUMP")) for l in lines)
+    for i, alpha in enumerate(_expected_alphas(0, 4, 2)):
+        k = lines.index(f"ALFA {alpha}")
+        assert lines[k + 1] == f"CPWR {_field_filename('cp', i)}"
+
+
+def test_bl_and_cp_are_both_written_for_each_alfa():
+    lines = script(outputs=("forces", "bl", "cp"))
+    for i, alpha in enumerate(_expected_alphas(0, 4, 2)):
+        k = lines.index(f"ALFA {alpha}")
+        assert lines[k + 1] == f"DUMP {_field_filename('bl', i)}"
+        assert lines[k + 2] == f"CPWR {_field_filename('cp', i)}"

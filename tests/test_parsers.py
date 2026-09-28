@@ -9,7 +9,7 @@ import pytest
 import shutil
 
 from xfoil_mcp.wrapper import (
-    BoundaryLayer, CpDistribution, PolarPoint, _collect_bl, _parse_bl_file, _parse_cp_file,
+    BoundaryLayer, CpDistribution, PolarPoint, _collect_fields, _parse_bl_file, _parse_cp_file,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -63,7 +63,7 @@ def pt(alpha: float) -> PolarPoint:
 
 def test_dump_for_converged_alpha_is_attached(tmp_path):
     shutil.copy(BL_A4, tmp_path / "bl_000.txt")
-    bl, warnings = _collect_bl(tmp_path, [4.0], {4.0: pt(4.0)})
+    bl, warnings = _collect_fields(tmp_path, [4.0], {4.0: pt(4.0)}, "bl", _parse_bl_file)
     assert set(bl) == {4.0}
     assert warnings == []
 
@@ -71,13 +71,13 @@ def test_dump_for_converged_alpha_is_attached(tmp_path):
 def test_dump_for_failed_alpha_is_ignored(tmp_path):
     """A perfectly good file, for an alpha that is not in the polar."""
     shutil.copy(BL_A4, tmp_path / "bl_000.txt")
-    bl, warnings = _collect_bl(tmp_path, [4.0], {})
+    bl, warnings = _collect_fields(tmp_path, [4.0], {}, "bl", _parse_bl_file)
     assert bl == {}
     assert warnings == []
 
 
 def test_missing_dump_for_converged_alpha_is_reported(tmp_path):
-    bl, warnings = _collect_bl(tmp_path, [4.0], {4.0: pt(4.0)})
+    bl, warnings = _collect_fields(tmp_path, [4.0], {4.0: pt(4.0)}, "bl", _parse_bl_file)
     assert bl == {}
     assert len(warnings) == 1 and "4.0" in warnings[0]
 
@@ -85,9 +85,16 @@ def test_missing_dump_for_converged_alpha_is_reported(tmp_path):
 def test_files_are_matched_to_alphas_by_position(tmp_path):
     """bl_001 belongs to the second requested alpha, whatever its value."""
     shutil.copy(BL_A4, tmp_path / "bl_001.txt")
-    bl, warnings = _collect_bl(tmp_path, [2.0, 4.0], {2.0: pt(2.0), 4.0: pt(4.0)})
+    bl, warnings = _collect_fields(tmp_path, [2.0, 4.0], {2.0: pt(2.0), 4.0: pt(4.0)}, "bl", _parse_bl_file)
     assert set(bl) == {4.0}
     assert "2.0" in warnings[0]          # bl_000 is missing
+
+def test_cp_dump_is_gated_the_same_way(tmp_path):
+    shutil.copy(CP_A4, tmp_path / "cp_000.txt")
+    cp, _ = _collect_fields(tmp_path, [4.0], {4.0: pt(4.0)}, "cp", _parse_cp_file)
+    assert set(cp) == {4.0}
+    cp, _ = _collect_fields(tmp_path, [4.0], {}, "cp", _parse_cp_file)
+    assert cp == {}
 
 # --- pressure distribution --------------------------------------------------
 

@@ -35,6 +35,10 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Callable
+from typing import TypeVar
+
+T = TypeVar("T")
 
 XFOIL_BIN = os.environ.get("XFOIL_BIN", "xfoil")
 
@@ -147,6 +151,7 @@ class PolarResult:
     returncode: int | None = None
     stdout: str = ""
     bl: dict[float, BoundaryLayer] = field(default_factory=dict)   # converged alphas only
+    cp: dict[float, CpDistribution] = field(default_factory=dict)   # converged alphas only
 
     @property
     def converged_count(self) -> int:
@@ -263,16 +268,18 @@ def _build_commands(
         "",              # decline the dump file
     ]
 
-    # DUMP writes only the current solution, so field output needs one 
-    # ALFA per point with a DUMP after each. Each ALFA warm-starts
-    # from the previous point, the same way ASEQ does internally.
-    # Runs that don't request "bl" keep the single ASEQ sweep.
-    if "bl" in outputs:
-        for i, alpha in enumerate(_expected_alphas(alpha_start, alpha_end, alpha_step)):
-            lines.append(f"ALFA {alpha}")
+    # One ALFA per point, whatever the outputs. ASEQ would give each point
+    # ITER+5 iterations and halt after 4 consecutive failures (xoper.f,
+    # NSEQEX = 4); ALFA gives exactly ITER and never halts. Using ALFA
+    # always means requesting output cannot change which points converge.
+    # Each ALFA warm-starts from the previous point. DUMP and CPWR write
+    # only the current solution, so they follow each point when requested.
+    for i, alpha in enumerate(_expected_alphas(alpha_start, alpha_end, alpha_step)):
+        lines.append(f"ALFA {alpha}")
+        if "bl" in outputs:
             lines.append(f"DUMP {_field_filename('bl', i)}")
-    else:
-        lines.append(f"ASEQ {alpha_start} {alpha_end} {alpha_step}")
+        if "cp" in outputs:
+            lines.append(f"CPWR {_field_filename('cp', i)}")
 
     lines += [
         "PACC",          # stop accumulating, flushes the file
@@ -407,28 +414,33 @@ def _match_alphas(requested: list[float], points: list[PolarPoint]) -> dict[floa
     tol = POLAR_ALPHA_RESOLUTION
     return {a: p for a in requested for p in points if abs(p.alpha - a) <= tol}
 
-def _collect_bl(
-    workdir: Path, requested: list[float], matched: dict[float, PolarPoint]
-) -> tuple[dict[float, BoundaryLayer], list[str]]:
-    """Parse the DUMP file for each converged alpha; ignore the rest.
+def _collect_fields(
+    workdir: Path,
+    requested: list[float],
+    matched: dict[float, PolarPoint],
+    kind: str,
+    parse: Callable[[Path, float], T | None],
+) -> tuple[dict[float, T], list[str]]:
+    """Parse the field file of one kind for each converged alpha; ignore the rest.
 
-    XFOIL writes a complete, well-formed DUMP file for every point, including
-    points that did not converge, and a converged file can legitimately hold
-    negative Cf. Neither can be judged by looking, so the polar decides: a
-    file is read only if its alpha appears in the polar. A converged alpha
-    whose file is missing or unreadable is reported, not silently skipped.
+    XFOIL writes complete, well-formed DUMP and CPWR files for every point,
+    including points that did not converge, and a converged file can
+    legitimately hold negative Cf. Neither can be judged by looking, so the
+    polar decides: a file is read only if its alpha appears in the polar. A
+    converged alpha whose file is missing or unreadable is reported, not
+    silently skipped. One function for every kind, so the rule cannot drift.
     """
-    bl: dict[float, BoundaryLayer] = {}
+    fields: dict[float, T] = {}
     warnings: list[str] = []
     for i, alpha in enumerate(requested):
         if alpha not in matched:
             continue
-        layer = _parse_bl_file(workdir / _field_filename("bl", i), alpha)
-        if layer is None:
-            warnings.append(f"bl dump missing or unreadable for converged alpha {alpha}")
+        parsed = parse(workdir / _field_filename(kind, i), alpha)
+        if parsed is None:
+            warnings.append(f"{kind} file missing or unreadable for converged alpha {alpha}")
         else:
-            bl[alpha] = layer
-    return bl, warnings
+            fields[alpha] = parsed
+    return fields, warnings
 
 def _scan_stdout(stdout: str, requested_max_iter: int) -> list[str]:
     """Pull failure evidence out of stdout.
@@ -529,14 +541,19 @@ def run_polar(
         # Match and read dump files here: the directory is deleted when
         # this block ends.
         matched = _match_alphas(requested, points)
+        wd = Path(workdir)
         bl, bl_warnings = (
-            _collect_bl(Path(workdir), requested, matched) if "bl" in outputs else ({}, [])
+            _collect_fields(wd, requested, matched, "bl", _parse_bl_file)
+            if "bl" in outputs else ({}, [])
+        )
+        cp, cp_warnings = (
+            _collect_fields(wd, requested, matched, "cp", _parse_cp_file)
+            if "cp" in outputs else ({}, [])
         )
 
     failed = [a for a in requested if a not in matched]
     warnings = _scan_stdout(stdout, max_iter)
-    warnings += bl_warnings
-
+    warnings += bl_warnings + cp_warnings
     if not points:
         warnings.append("no converged points; check warnings above")
 
@@ -554,6 +571,7 @@ def run_polar(
         returncode=proc.returncode,
         stdout=stdout,
         bl=bl,
+        cp=cp,
     )
 
 
