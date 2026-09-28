@@ -195,3 +195,21 @@ def test_bl_and_cp_from_one_run_are_the_same_solution():
         layer, cp = result.bl[alpha], result.cp[alpha]
         for c, ue in zip(cp.cp, layer.ue[: layer.n_surface]):
             assert c == pytest.approx(1 - ue**2, abs=5e-5)
+
+def test_flap_increases_lift_and_nose_down_moment():
+    clean = run_polar("2412", 1e6, 0, 0, 1)
+    flapped = run_polar("2412", 1e6, 0, 0, 1, flap=(0.7, 0.0, 10.0))
+    assert flapped.points[0].cl > clean.points[0].cl + 0.5
+    assert flapped.points[0].cm < clean.points[0].cm - 0.05
+
+
+def test_negative_flap_reduces_lift():
+    clean = run_polar("2412", 1e6, 2, 2, 1)
+    up = run_polar("2412", 1e6, 2, 2, 1, flap=(0.7, 0.0, -10.0))
+    assert up.points[0].cl < clean.points[0].cl
+
+def test_flapped_airfoil_is_repaneled_to_the_standard_count():
+    result = run_polar("2412", 1e6, 0, 0, 1, outputs=("cp",), flap=(0.7, 0.0, 10.0))
+    assert result.points[0].cl > 0.9          # the flap actually applied
+    assert len(result.cp[0.0].x) == 160       # and PANE rebuilt the grid
+

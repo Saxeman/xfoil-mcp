@@ -9,12 +9,11 @@ import pytest
 
 from xfoil_mcp.wrapper import _build_commands, _expected_alphas, _field_filename
 
-
-def script(outputs=("forces",), start=0, end=4, step=2) -> list[str]:
+def script(outputs=("forces",), start=0, end=4, step=2, flap=None) -> list[str]:
     return _build_commands(
         airfoil="2412", reynolds=1e6, mach=0.0, n_crit=9.0, max_iter=100,
         alpha_start=start, alpha_end=end, alpha_step=step,
-        polar_path="polar.txt", outputs=outputs,
+        polar_path="polar.txt", outputs=outputs, flap=flap,
     ).split("\n")
 
 
@@ -70,3 +69,13 @@ def test_bl_and_cp_are_both_written_for_each_alfa():
         k = lines.index(f"ALFA {alpha}")
         assert lines[k + 1] == f"DUMP {_field_filename('bl', i)}"
         assert lines[k + 2] == f"CPWR {_field_filename('cp', i)}"
+
+def test_no_flap_means_no_geometry_menu():
+    assert "GDES" not in script()
+
+
+def test_flap_is_applied_and_repaneled_before_analysis():
+    lines = script(flap=(0.7, 0.0, 10.0))
+    k = lines.index("GDES")
+    assert lines[k:k + 5] == ["GDES", "FLAP 0.7 0.0 10.0", "EXEC", "", "PANE"]
+    assert lines.index("NACA 2412") < k < lines.index("OPER")

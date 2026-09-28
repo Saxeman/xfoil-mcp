@@ -54,6 +54,10 @@ _VISCAL_FAILURE = re.compile(r"VISCAL:\s+Convergence failed")
 _MRCHDU_FAILURE = re.compile(r"MRCH(DU|UE):\s+Convergence failed")
 _ITER_LIMIT_ECHO = re.compile(r"Current iteration limit:\s+(\d+)")
 _DISPLAY_ABORT = re.compile(r"Cannot open display")
+_BUFFER_MISMATCH = re.compile(r"Buffer airfoil is not identical")
+_FLAP_HINGE = re.compile(r"Flap hinge: x,y =\s+([-\d.]+)\s+([-\d.]+)")
+_BUFFER_TO_CURRENT = re.compile(r"Current airfoil nodes set from buffer airfoil nodes")
+_SURFACE_Y = re.compile(r"(Top|Bottom)\s+surface:\s+y =\s+([-\d.]+)")
 
 # Meta info about .bl file outputs
 BL_SURFACE_COLS = 12
@@ -244,6 +248,7 @@ def _build_commands(
     alpha_step: float,
     polar_path: str,
     outputs: tuple[str, ...] = ("forces",),
+    flap: tuple[float, float, float] | None = None,
 ) -> str:
     """Assemble the command script.
 
@@ -256,6 +261,19 @@ def _build_commands(
         "G",             # toggle graphics off - required when headless
         "",              # leave PLOP
         f"NACA {airfoil}",
+    ]
+
+    if flap is not None:
+        x_hinge, y_hinge, deflection = flap
+        lines += [
+            "GDES",                                    # geometry menu edits the buffer airfoil
+            f"FLAP {x_hinge} {y_hinge} {deflection}",  # hinge x, hinge y (chord), degrees, + = TE down
+            "EXEC",                                    # copy buffer to the current airfoil
+            "",                                        # leave GDES
+            "PANE",                                    # repanel: EXEC keeps the buffer's own points
+        ]
+
+    lines += [
         "OPER",
         f"ITER {max_iter}",
         "VPAR",          # viscous parameters
@@ -482,6 +500,34 @@ def _scan_stdout(stdout: str, requested_max_iter: int) -> list[str]:
 
     return warnings
 
+def _check_geometry_applied(stdout: str, flap: tuple[float, float, float] | None) -> None:
+    """Require positive evidence that a requested flap reached the analysis.
+
+    Checking only for a failure message misses the case where the flap never
+    reached XFOIL at all: nothing was edited, so nothing reports a mismatch,
+    and every number silently describes the clean airfoil. XFOIL echoes the
+    hinge when FLAP runs and announces EXEC, so both are required.
+    Deflection is not echoed; the physics tests cover its sign and size.
+    """
+    if flap is None:
+        return
+    hinge = _FLAP_HINGE.search(stdout)
+    if hinge is None:
+        raise XfoilError("flap requested but XFOIL never applied one (no 'Flap hinge' line)")
+    x, y = float(hinge.group(1)), float(hinge.group(2))
+    if abs(x - flap[0]) > 1e-4 or abs(y - flap[1]) > 1e-4:
+        raise XfoilError(f"flap hinge applied at ({x}, {y}), requested ({flap[0]}, {flap[1]})")
+    if not _BUFFER_TO_CURRENT.search(stdout) or _BUFFER_MISMATCH.search(stdout):
+        raise XfoilError("flap reached the buffer airfoil but never reached the analysis")
+
+    surfaces = {side: float(y) for side, y in _SURFACE_Y.findall(stdout)}
+    if "Top" not in surfaces or "Bottom" not in surfaces:
+        raise XfoilError("flap applied but XFOIL did not report the surface at the hinge")
+    if not surfaces["Bottom"] < flap[1] < surfaces["Top"]:
+        raise XfoilError(
+            f"flap hinge y={flap[1]} is outside the airfoil at x={flap[0]} "
+            f"(surface spans {surfaces['Bottom']} to {surfaces['Top']})"
+        )
 
 def run_polar(
     airfoil: str,
@@ -494,6 +540,7 @@ def run_polar(
     max_iter: int = 100,
     timeout: float = 120.0,
     outputs: tuple[str, ...] = ("forces",),
+    flap: tuple[float, float, float] | None = None,
 ) -> PolarResult:
     """Run a viscous alpha sweep and return a validated result.
 
@@ -512,7 +559,7 @@ def run_polar(
         commands = _build_commands(
             airfoil, reynolds, mach, n_crit, max_iter,
             alpha_start, alpha_end, alpha_step, polar_path.name,
-            outputs=outputs,
+            outputs=outputs, flap=flap,
         )
 
         started = time.monotonic()
@@ -554,6 +601,7 @@ def run_polar(
     failed = [a for a in requested if a not in matched]
     warnings = _scan_stdout(stdout, max_iter)
     warnings += bl_warnings + cp_warnings
+    _check_geometry_applied(stdout, flap)
     if not points:
         warnings.append("no converged points; check warnings above")
 

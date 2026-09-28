@@ -38,7 +38,7 @@ class Flap(_Strict):
     positive for trailing edge down (which increases lift).
     """
 
-    x_hinge: float = Field(gt=0.0, lt=1.0)
+    x_hinge: float = Field(ge=0.5, le=0.9)
     y_hinge: float = Field(default=0.0, ge=-0.5, le=0.5)
     deflection: float = Field(ge=-45.0, le=45.0)
 
