@@ -38,9 +38,12 @@ from pathlib import Path
 
 XFOIL_BIN = os.environ.get("XFOIL_BIN", "xfoil")
 
-# Alphas are floats echoed back through a text file, so requested and
-# returned values are matched within this tolerance rather than by equality.
-ALPHA_TOL = 1e-6
+# The polar file prints alpha to three decimals, so a solved 0.0625 comes
+# back as 0.062. Requested and returned alphas are matched within that
+# resolution. The step must stay well above it, or two requested alphas
+# could match the same row.
+POLAR_ALPHA_RESOLUTION = 1e-3
+MIN_ALPHA_STEP = 0.01
 
 # Define failure modes
 _VISCAL_FAILURE = re.compile(r"VISCAL:\s+Convergence failed")
@@ -182,11 +185,15 @@ class PolarResult:
             "runtime_seconds": round(self.runtime_seconds, 2),
         }
 
-
 def _expected_alphas(start: float, end: float, step: float) -> list[float]:
     """Reproduce ASEQ's sequence without accumulating float error."""
     if step <= 0:
         raise ValueError("alpha_step must be positive")
+    if step < MIN_ALPHA_STEP:
+        raise ValueError(
+            f"alpha_step {step} is finer than the polar file can distinguish; "
+            f"minimum is {MIN_ALPHA_STEP}"
+        )
     if end < start:
         raise ValueError("alpha_end must be >= alpha_start")
     n = int(round((end - start) / step))
@@ -340,6 +347,18 @@ def _parse_bl_file(path: Path, alpha: float) -> BoundaryLayer | None:
         n_surface=len(surface),
     )
 
+def _match_alphas(requested: list[float], points: list[PolarPoint]) -> dict[float, PolarPoint]:
+    """Map each requested alpha to the polar row that reports it, if any.
+
+    The tolerance is the full printed resolution, not half of it. A value
+    exactly halfway between two printed values (0.0625 printed as 0.062)
+    differs by exactly half, and floating-point subtraction lands a hair over.
+    Requested alphas are at least MIN_ALPHA_STEP apart, ten times this
+    tolerance, so no row can match two of them.
+    """
+    tol = POLAR_ALPHA_RESOLUTION
+    return {a: p for a in requested for p in points if abs(p.alpha - a) <= tol}
+
 def _scan_stdout(stdout: str, requested_max_iter: int) -> list[str]:
     """Pull failure evidence out of stdout.
 
@@ -435,8 +454,8 @@ def run_polar(
         stdout = proc.stdout or ""
         points = _parse_polar_file(polar_path)
 
-    returned = {round(p.alpha, 6) for p in points}
-    failed = [a for a in requested if a not in returned]
+    matched = _match_alphas(requested, points)
+    failed = [a for a in requested if a not in matched]
     warnings = _scan_stdout(stdout, max_iter)
 
     if not points:

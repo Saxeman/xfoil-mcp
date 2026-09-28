@@ -178,3 +178,10 @@ def test_result_round_trips_through_json():
         provenance={"content_hash": make_case().content_hash()},
     )
     assert CaseResult.model_validate_json(r.model_dump_json()) == r
+
+def test_alpha_step_has_a_floor():
+    """Finer than 0.01 deg, requested alphas crowd within the polar file's
+    printed precision and can no longer be told apart."""
+    make_case(conditions=dict(alpha_start=0, alpha_end=1, alpha_step=0.01))
+    with pytest.raises(ValidationError):
+        make_case(conditions=dict(alpha_start=0, alpha_end=1, alpha_step=0.005))

@@ -140,3 +140,11 @@ def test_lower_surface_stays_laminar_at_moderate_alpha(by_alpha):
     """At positive alpha the lower surface sees a gentler gradient and stays
     laminar to the trailing edge."""
     assert by_alpha[6.0].bot_xtr == pytest.approx(1.0)
+
+def test_fine_step_reports_only_genuine_failures():
+    """0.0625 steps are printed as 0.062, 0.188, ... in the polar. The
+    bookkeeping must agree with the solver: every reported failure should
+    correspond to a VISCAL failure, and nothing else."""
+    result = run_polar("2412", 1e6, 0, 0.5, 0.0625)
+    viscal = result.stdout.count("VISCAL:  Convergence failed")
+    assert len(result.failed_alphas) == viscal

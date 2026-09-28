@@ -71,7 +71,10 @@ class Conditions(_Strict):
     )
     alpha_start: float = Field(ge=-30.0, le=30.0)
     alpha_end: float = Field(ge=-30.0, le=30.0)
-    alpha_step: float = Field(gt=0.0)
+    alpha_step: float = Field(
+        ge=0.01,
+        description="Degrees. Finer than 0.01 exceeds the polar file's printed precision",
+    )
     max_iter: int = Field(default=100, ge=1, le=500)
 
     @model_validator(mode="after")
