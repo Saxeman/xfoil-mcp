@@ -190,8 +190,16 @@ def _expected_alphas(start: float, end: float, step: float) -> list[float]:
     if end < start:
         raise ValueError("alpha_end must be >= alpha_start")
     n = int(round((end - start) / step))
-    return [round(start + i * step, 6) for i in range(n + 1)]
+    return [round(float(start + i * step), 6) for i in range(n + 1)]
 
+def _field_filename(kind: str, index: int) -> str:
+    """Dump files are named by position in the sweep, not by alpha.
+
+    An alpha like -2.5 would put a minus sign and a decimal point into a
+    filename XFOIL parses from its own command line. The index maps back to
+    alpha through _expected_alphas, the single definition of the sweep.
+    """
+    return f"{kind}_{index:03d}.txt"
 
 def _build_commands(
     airfoil: str,
@@ -203,6 +211,7 @@ def _build_commands(
     alpha_end: float,
     alpha_step: float,
     polar_path: str,
+    outputs: tuple[str, ...] = ("forces",),
 ) -> str:
     """Assemble the command script.
 
@@ -210,30 +219,41 @@ def _build_commands(
     is consumed as an answer to the wrong question, so they are written
     explicitly rather than generated.
     """
-    return "\n".join(
-        [
-            "PLOP",          # plotting options
-            "G",             # toggle graphics off - required when headless
-            "",              # leave PLOP
-            f"NACA {airfoil}",
-            "OPER",
-            f"ITER {max_iter}",
-            "VPAR",          # viscous parameters
-            f"N {n_crit}",
-            "",              # leave VPAR
-            f"VISC {reynolds}",
-            f"MACH {mach}",
-            "PACC",
-            polar_path,      # polar save file
-            "",              # decline the dump file, BUG: this will generate a dump file anyways
-            f"ASEQ {alpha_start} {alpha_end} {alpha_step}",
-            "PACC",          # stop accumulating, flushes the file
-            "",              # leave OPER
-            "QUIT",
-            "",              # trailing newline so stdin is never exhausted mid-prompt
-        ]
-    )
+    lines = [
+        "PLOP",          # plotting options
+        "G",             # toggle graphics off - required when headless
+        "",              # leave PLOP
+        f"NACA {airfoil}",
+        "OPER",
+        f"ITER {max_iter}",
+        "VPAR",          # viscous parameters
+        f"N {n_crit}",
+        "",              # leave VPAR
+        f"VISC {reynolds}",
+        f"MACH {mach}",
+        "PACC",
+        polar_path,      # polar save file
+        "",              # decline the dump file
+    ]
 
+    # DUMP writes only the current solution, so field output needs one 
+    # ALFA per point with a DUMP after each. Each ALFA warm-starts
+    # from the previous point, the same way ASEQ does internally.
+    # Runs that don't request "bl" keep the single ASEQ sweep.
+    if "bl" in outputs:
+        for i, alpha in enumerate(_expected_alphas(alpha_start, alpha_end, alpha_step)):
+            lines.append(f"ALFA {alpha}")
+            lines.append(f"DUMP {_field_filename('bl', i)}")
+    else:
+        lines.append(f"ASEQ {alpha_start} {alpha_end} {alpha_step}")
+
+    lines += [
+        "PACC",          # stop accumulating, flushes the file
+        "",              # leave OPER
+        "QUIT",
+        "",              # trailing newline so stdin is never exhausted mid-prompt
+    ]
+    return "\n".join(lines)
 
 def _parse_polar_file(path: Path) -> list[PolarPoint]:
     """Parse the fixed-width polar table.

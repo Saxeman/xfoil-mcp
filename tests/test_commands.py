@@ -1,0 +1,56 @@
+"""Command-script tests. Pure string checks; no XFOIL needed.
+
+The script is the only interface to XFOIL, and every line in it answers a
+prompt. These tests pin its shape so a change to one branch cannot quietly
+shift the others.
+"""
+
+import pytest
+
+from xfoil_mcp.wrapper import _build_commands, _expected_alphas, _field_filename
+
+
+def script(outputs=("forces",), start=0, end=4, step=2) -> list[str]:
+    return _build_commands(
+        airfoil="2412", reynolds=1e6, mach=0.0, n_crit=9.0, max_iter=100,
+        alpha_start=start, alpha_end=end, alpha_step=step,
+        polar_path="polar.txt", outputs=outputs,
+    ).split("\n")
+
+
+def test_forces_only_uses_one_aseq_sweep():
+    lines = script()
+    assert "ASEQ 0 4 2" in lines
+    assert not any(l.startswith(("ALFA", "DUMP")) for l in lines)
+
+
+def test_bl_output_solves_each_alpha_individually():
+    lines = script(outputs=("forces", "bl"))
+    assert not any(l.startswith("ASEQ") for l in lines)
+    assert [l for l in lines if l.startswith("ALFA")] == ["ALFA 0.0", "ALFA 2.0", "ALFA 4.0"]
+
+
+def test_each_alfa_is_followed_by_its_dump():
+    lines = script(outputs=("bl",))
+    for i, alpha in enumerate(_expected_alphas(0, 4, 2)):
+        k = lines.index(f"ALFA {alpha}")
+        assert lines[k + 1] == f"DUMP {_field_filename('bl', i)}"
+
+
+def test_dump_files_are_named_by_position_not_alpha():
+    lines = script(outputs=("bl",), start=-2, end=2, step=1)
+    dumps = [l.split()[1] for l in lines if l.startswith("DUMP")]
+    assert dumps == ["bl_000.txt", "bl_001.txt", "bl_002.txt", "bl_003.txt", "bl_004.txt"]
+
+
+@pytest.mark.parametrize("outputs", [("forces",), ("forces", "bl")])
+def test_script_frame_is_unchanged(outputs):
+    """The lines around the sweep must be identical in both modes: graphics
+    off first, polar accumulation opened with its two prompt answers, and
+    the exact unwind at the end. One missing blank line desynchronizes
+    everything after it."""
+    lines = script(outputs=outputs)
+    assert lines[:3] == ["PLOP", "G", ""]
+    k = lines.index("PACC")
+    assert lines[k + 1] == "polar.txt" and lines[k + 2] == ""
+    assert lines[-4:] == ["PACC", "", "QUIT", ""]
