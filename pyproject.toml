@@ -16,6 +16,7 @@ markers = [
 [project.optional-dependencies]
 control = ["fastmcp"]
 sandbox = ["numpy", "scipy"]
+thermal = ["numpy", "scipy", "scikit-fem"]
 dev = ["pytest"]
 
 [build-system]
