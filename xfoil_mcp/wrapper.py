@@ -33,6 +33,7 @@ import re
 import subprocess
 import tempfile
 import time
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Callable
@@ -156,6 +157,7 @@ class PolarResult:
     stdout: str = ""
     bl: dict[float, BoundaryLayer] = field(default_factory=dict)   # converged alphas only
     cp: dict[float, CpDistribution] = field(default_factory=dict)   # converged alphas only
+    march_failures: int = 0
 
     @property
     def converged_count(self) -> int:
@@ -212,6 +214,7 @@ class PolarResult:
             "max_cl_alpha": None if peak_cl is None else peak_cl.alpha,
             "warnings": self.warnings,
             "runtime_seconds": round(self.runtime_seconds, 2),
+            "march_failures": self.march_failures,
         }
 
 def _expected_alphas(start: float, end: float, step: float) -> list[float]:
@@ -347,6 +350,16 @@ def _parse_polar_file(path: Path) -> list[PolarPoint]:
         )
     return points
 
+def _drop_non_finite(points: list[PolarPoint]) -> tuple[list[PolarPoint], list[float]]:
+    """Split polar rows into usable ones and the alphas of rows holding NaN or inf.
+
+    XFOIL writes NaN when a calculation blows up, and float("NaN") parses
+    without complaint. A row with a non-finite value is not a converged
+    point, whatever the polar file says.
+    """
+    kept = [p for p in points if all(math.isfinite(v) for v in vars(p).values())]
+    dropped = [p.alpha for p in points if p not in kept]
+    return kept, dropped
 
 
 def _parse_bl_file(path: Path, alpha: float) -> BoundaryLayer | None:
@@ -370,6 +383,8 @@ def _parse_bl_file(path: Path, alpha: float) -> BoundaryLayer | None:
             continue
         try:
             values = [float(f) for f in fields]
+            if not all(math.isfinite(v) for v in values):
+                return None
         except ValueError:
             return None
 
@@ -411,6 +426,8 @@ def _parse_cp_file(path: Path, alpha: float) -> CpDistribution | None:
             return None
         try:
             x, cp = float(fields[0]), float(fields[1])
+            if not (math.isfinite(x) and math.isfinite(cp)):
+                return None
         except ValueError:
             return None
         xs.append(x)
@@ -585,8 +602,8 @@ def run_polar(
         runtime = time.monotonic() - started
         stdout = proc.stdout or ""
         points = _parse_polar_file(polar_path)
-        # Match and read dump files here: the directory is deleted when
-        # this block ends.
+        points = _parse_polar_file(polar_path)
+        points, non_finite = _drop_non_finite(points)
         matched = _match_alphas(requested, points)
         wd = Path(workdir)
         bl, bl_warnings = (
@@ -604,6 +621,9 @@ def run_polar(
     _check_geometry_applied(stdout, flap)
     if not points:
         warnings.append("no converged points; check warnings above")
+    if non_finite:
+        warnings.append(f"non-finite values in the polar at alphas {non_finite}; treated as not converged")
+    march = len(_MRCHDU_FAILURE.findall(stdout))
 
     return PolarResult(
         airfoil=airfoil,
@@ -620,6 +640,7 @@ def run_polar(
         stdout=stdout,
         bl=bl,
         cp=cp,
+        march_failures=march,
     )
 
 

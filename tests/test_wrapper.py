@@ -213,3 +213,7 @@ def test_flapped_airfoil_is_repaneled_to_the_standard_count():
     assert result.points[0].cl > 0.9          # the flap actually applied
     assert len(result.cp[0.0].x) == 160       # and PANE rebuilt the grid
 
+def test_march_failures_are_reported_as_a_number():
+    summary = run_polar("2412", 1e6, 0, 4, 2).summary()
+    assert isinstance(summary["march_failures"], int)
+    assert summary["march_failures"] >= 0

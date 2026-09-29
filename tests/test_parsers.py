@@ -9,7 +9,7 @@ import pytest
 import shutil
 
 from xfoil_mcp.wrapper import (
-    BoundaryLayer, CpDistribution, PolarPoint, _collect_fields, _parse_bl_file, _parse_cp_file,
+    BoundaryLayer, CpDistribution, PolarPoint, _collect_fields, _parse_bl_file, _parse_cp_file, _drop_non_finite,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -136,3 +136,25 @@ def test_cp_rejects_a_row_with_the_wrong_column_count(tmp_path):
 
 def test_cp_missing_file_returns_none(tmp_path):
     assert _parse_cp_file(tmp_path / "nope.txt", alpha=0.0) is None
+
+# --- non-finite values ------------------------------------------------------
+
+def test_bl_file_with_a_nan_is_rejected(tmp_path):
+    text = BL_A4.read_text().replace("0.001183", "NaN", 1)
+    (tmp_path / "bl.txt").write_text(text)
+    assert _parse_bl_file(tmp_path / "bl.txt", alpha=4.0) is None
+
+
+def test_cp_file_with_a_nan_is_rejected(tmp_path):
+    lines = CP_A4.read_text().splitlines()
+    lines[5] = "     0.95000        NaN"
+    (tmp_path / "cp.txt").write_text("\n".join(lines))
+    assert _parse_cp_file(tmp_path / "cp.txt", alpha=4.0) is None
+
+
+def test_polar_rows_with_non_finite_values_are_dropped():
+    good = PolarPoint(alpha=0.0, cl=0.24, cd=0.0056, cdp=0.0005, cm=-0.05, top_xtr=0.65, bot_xtr=0.68)
+    bad = PolarPoint(alpha=1.0, cl=float("nan"), cd=0.0055, cdp=0.0006, cm=-0.05, top_xtr=0.59, bot_xtr=0.86)
+    kept, dropped = _drop_non_finite([good, bad])
+    assert kept == [good]
+    assert dropped == [1.0]
