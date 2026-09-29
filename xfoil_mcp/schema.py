@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -88,13 +89,15 @@ class Conditions(_Strict):
         return self
 
     def point_count(self) -> int:
-        return int(round((self.alpha_end - self.alpha_start) / self.alpha_step)) + 1
+        # Floor, never round: rounding up adds a point past alpha_end. The
+        # epsilon keeps an exact endpoint that division lands a hair under.
+        return math.floor((self.alpha_end - self.alpha_start) / self.alpha_step + 1e-9) + 1
 
     def alphas(self) -> list[float]:
         """The sequence XFOIL's ASEQ will produce, without float drift.
 
         Kept in step with wrapper._expected_alphas, which cannot import this
-        module. test_wrapper asserts they agree.
+        module. test_schema asserts they agree.
         """
         return [
             round(self.alpha_start + i * self.alpha_step, 6)

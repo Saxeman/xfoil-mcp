@@ -234,7 +234,9 @@ def _expected_alphas(start: float, end: float, step: float) -> list[float]:
         )
     if end < start:
         raise ValueError("alpha_end must be >= alpha_start")
-    n = int(round((end - start) / step))
+    # Floor, never round: rounding up adds a point past end. Kept in step
+    # with schema.Conditions.point_count.
+    n = math.floor((end - start) / step + 1e-9)
     return [round(float(start + i * step), 6) for i in range(n + 1)]
 
 def _field_filename(kind: str, index: int) -> str:

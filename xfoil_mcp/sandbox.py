@@ -14,6 +14,7 @@ import os
 import subprocess
 import time
 import uuid
+import logging
 from dataclasses import dataclass, field
 
 from xfoil_mcp.schema import Case
@@ -95,7 +96,10 @@ def run_campaign_source(source: str, timeout: float = 30.0) -> SandboxOutcome:
     finally:
         # Every path out of this function ends here, including the early
         # returns above. --rm handles a clean exit; this handles the rest.
-        rm = subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True, timeout=15)
-        if rm.returncode != 0 and "No such container" not in rm.stderr:
-            logging.getLogger(__name__).warning("failed to remove %s: %s", name, rm.stderr.strip())
+        # Best effort: a failed cleanup must not replace the outcome above,
+        # including when docker itself is missing or hangs.
+        try:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=15)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
 

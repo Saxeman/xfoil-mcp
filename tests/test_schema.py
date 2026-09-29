@@ -185,3 +185,25 @@ def test_alpha_step_has_a_floor():
     make_case(conditions=dict(alpha_start=0, alpha_end=1, alpha_step=0.01))
     with pytest.raises(ValidationError):
         make_case(conditions=dict(alpha_start=0, alpha_end=1, alpha_step=0.005))
+
+
+def test_sweep_never_passes_alpha_end():
+    c = make_case(conditions=dict(alpha_start=0, alpha_end=11, alpha_step=4))
+    assert c.alphas() == [0.0, 4.0, 8.0]
+    c = make_case(conditions=dict(alpha_start=29, alpha_end=30, alpha_step=0.6))
+    assert c.alphas() == [29.0, 29.6]
+
+
+def test_sweep_keeps_endpoint_despite_float_division():
+    # 0.3 / 0.1 is 2.9999999999999996; a bare floor would drop 0.3.
+    c = make_case(conditions=dict(alpha_start=0, alpha_end=0.3, alpha_step=0.1))
+    assert c.alphas() == [0.0, 0.1, 0.2, 0.3]
+
+
+@pytest.mark.parametrize("start,end,step", [
+    (0, 11, 4), (29, 30, 0.6), (0, 0.3, 0.1), (-5, 12, 1), (0, 10, 3), (-2.5, 2.5, 0.25),
+])
+def test_schema_and_wrapper_sweeps_agree(start, end, step):
+    from xfoil_mcp.wrapper import _expected_alphas
+    c = make_case(conditions=dict(alpha_start=start, alpha_end=end, alpha_step=step))
+    assert c.alphas() == _expected_alphas(start, end, step)
