@@ -43,6 +43,33 @@ class Flap(_Strict):
     y_hinge: float = Field(default=0.0, ge=-0.5, le=0.5)
     deflection: float = Field(ge=-45.0, le=45.0)
 
+class Thermal(_Strict):
+    """A leading-edge heater and the flight condition it operates in.
+
+    Evaluated once per converged alpha from the aero sweep. Units are in the
+    field names so a campaign cannot confuse millimetres with metres.
+
+    Airspeed is not a field: it follows from the Reynolds number, the chord,
+    and the air (coupling.velocity_for), so the thermal model can never
+    describe a flight condition XFOIL did not solve.
+    """
+
+    chord_m: float = Field(gt=0.0, le=10.0)
+    air_temperature_k: float = Field(ge=200.0, le=320.0)
+    pressure_pa: float = Field(default=101325.0, ge=20000.0, le=110000.0)
+    heater_width: float = Field(
+        gt=0.0, le=0.5,
+        description="Band width along the surface, as a fraction of chord, "
+                    "centred on the stagnation point",
+    )
+    heater_power_w_per_m: float = Field(
+        gt=0.0, le=100000.0, description="Total heater power per metre of span",
+    )
+    skin_thickness_m: float = Field(gt=0.0, le=0.01)
+    skin_conductivity_w_mk: float = Field(
+        gt=0.0, le=500.0, description="About 200 for aluminium, about 1 for composite",
+    )
+
 
 class Geometry(_Strict):
     """What airfoil to analyze. NACA 4- and 5-digit designations only, for now."""
@@ -116,6 +143,7 @@ class Case(_Strict):
     conditions: Conditions
     outputs: tuple[Output, ...] = ("forces",)
     label: str | None = Field(default=None, max_length=80)
+    thermal: Thermal | None = None
 
     @field_validator("outputs")
     @classmethod
@@ -125,6 +153,14 @@ class Case(_Strict):
         if len(set(value)) != len(value):
             raise ValueError("outputs must not repeat")
         return tuple(sorted(value))
+
+    @model_validator(mode="after")
+    def _thermal_needs_boundary_layer(self) -> Case:
+        """The heat transfer model is built from XFOIL's skin friction and
+        edge velocity, which only exist when the case asks for them."""
+        if self.thermal is not None and "bl" not in self.outputs:
+            raise ValueError("thermal requires 'bl' in outputs")
+        return self
 
     def content_hash(self) -> str:
         """Stable identity for dedup and provenance.

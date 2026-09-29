@@ -207,3 +207,55 @@ def test_schema_and_wrapper_sweeps_agree(start, end, step):
     from xfoil_mcp.wrapper import _expected_alphas
     c = make_case(conditions=dict(alpha_start=start, alpha_end=end, alpha_step=step))
     assert c.alphas() == _expected_alphas(start, end, step)
+
+# --- thermal ----------------------------------------------------------------
+
+def thermal(**overrides) -> dict:
+    base = dict(
+        chord_m=0.5, air_temperature_k=263.15, heater_width=0.1,
+        heater_power_w_per_m=500.0, skin_thickness_m=0.001, skin_conductivity_w_mk=200.0,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_thermal_block_is_optional():
+    assert make_case().thermal is None
+
+
+def test_valid_thermal_block():
+    case = make_case(outputs=("forces", "bl"), thermal=thermal())
+    assert case.thermal.chord_m == 0.5
+    assert case.thermal.pressure_pa == 101325.0
+
+
+def test_thermal_requires_boundary_layer_output():
+    with pytest.raises(ValidationError, match="bl"):
+        make_case(outputs=("forces",), thermal=thermal())
+
+
+@pytest.mark.parametrize("field, bad", [
+    ("chord_m", 0.0),
+    ("air_temperature_k", 150.0),
+    ("pressure_pa", 5000.0),
+    ("heater_width", 0.8),
+    ("heater_power_w_per_m", -1.0),
+    ("skin_thickness_m", 0.1),
+    ("skin_conductivity_w_mk", 0.0),
+])
+def test_thermal_bounds(field, bad):
+    with pytest.raises(ValidationError):
+        make_case(outputs=("bl",), thermal=thermal(**{field: bad}))
+
+
+def test_unknown_thermal_field_is_rejected():
+    """A campaign that writes chord= instead of chord_m= must fail, not default."""
+    with pytest.raises(ValidationError):
+        make_case(outputs=("bl",), thermal=thermal(chord=0.5))
+
+
+def test_hash_changes_with_thermal_inputs():
+    base = make_case(outputs=("bl",), thermal=thermal())
+    assert base.content_hash() != make_case(outputs=("bl",)).content_hash()
+    assert base.content_hash() != make_case(
+        outputs=("bl",), thermal=thermal(heater_power_w_per_m=600.0)).content_hash()
