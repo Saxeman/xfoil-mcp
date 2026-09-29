@@ -72,6 +72,11 @@ class XfoilError(Exception):
     what that means.
     """
 
+class InvalidGeometry(XfoilError):
+    """The requested geometry cannot exist, e.g. a flap hinge outside the
+    airfoil. The request was wrong, so retrying cannot help; the worker
+    reports it as an input failure rather than infrastructure."""
+
 
 @dataclass(frozen=True)
 class PolarPoint:
@@ -215,6 +220,7 @@ class PolarResult:
             "warnings": self.warnings,
             "runtime_seconds": round(self.runtime_seconds, 2),
             "march_failures": self.march_failures,
+            "field_outputs": {"bl": sorted(self.bl), "cp": sorted(self.cp)},
         }
 
 def _expected_alphas(start: float, end: float, step: float) -> list[float]:
@@ -541,7 +547,7 @@ def _check_geometry_applied(stdout: str, flap: tuple[float, float, float] | None
     if "Top" not in surfaces or "Bottom" not in surfaces:
         raise XfoilError("flap applied but XFOIL did not report the surface at the hinge")
     if not surfaces["Bottom"] < flap[1] < surfaces["Top"]:
-        raise XfoilError(
+        raise InvalidGeometry(
             f"flap hinge y={flap[1]} is outside the airfoil at x={flap[0]} "
             f"(surface spans {surfaces['Bottom']} to {surfaces['Top']})"
         )

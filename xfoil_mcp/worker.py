@@ -18,7 +18,7 @@ import traceback
 from datetime import datetime, timezone
 
 from xfoil_mcp.schema import Case, CaseResult
-from xfoil_mcp.wrapper import PolarResult, XfoilError, run_polar
+from xfoil_mcp.wrapper import InvalidGeometry, PolarResult, XfoilError, run_polar
 
 SOLVER = "xfoil 6.99"
 
@@ -32,41 +32,28 @@ def _provenance(case: Case, runtime: float) -> dict:
         "runtime_seconds": round(runtime, 3),
     }
 
-
 def _serialize(result: PolarResult) -> dict:
     """Full data, minus stdout. The stdout log can be tens of kilobytes and
-    belongs in a log store, not a result payload."""
+    belongs in a log store, not a result payload.
+
+    Field outputs are keyed by alpha, a float. JSON object keys must be
+    strings, so 4.0 becomes "4.0" here, in one place. The host reads them
+    back with float(key).
+    """
     d = dataclasses.asdict(result)
     d.pop("stdout", None)
+    d["bl"] = {str(alpha): layer for alpha, layer in d["bl"].items()}
+    d["cp"] = {str(alpha): dist for alpha, dist in d["cp"].items()}
     return d
-
-
-def _not_implemented(case: Case, what: str, started: float) -> CaseResult:
-    """A capability the schema allows but the wrapper cannot deliver yet.
-
-    Reported as an input failure: retrying will never help, and the caller
-    should change the case rather than wait.
-    """
-    return CaseResult(
-        case=case,
-        status="error",
-        failure_kind="input",
-        summary={"error": f"{what} is not implemented in this worker"},
-        provenance=_provenance(case, time.monotonic() - started),
-    )
-
 
 def run_case(case: Case) -> CaseResult:
     started = time.monotonic()
 
-    if case.geometry.flap is not None:
-        # TODO: IMPLEMENT ME
-        return _not_implemented(case, "flap deflection", started)
-    if set(case.outputs) - {"forces"}:
-        # TODO: IMPLEMENT ME
-        return _not_implemented(case, f"outputs {case.outputs}", started)
-
     c = case.conditions
+    f = case.geometry.flap
+    flap = None if f is None else (f.x_hinge, f.y_hinge, f.deflection)
+
+    
     try:
         polar = run_polar(
             airfoil=case.geometry.naca,
@@ -77,6 +64,16 @@ def run_case(case: Case) -> CaseResult:
             mach=c.mach,
             n_crit=c.n_crit,
             max_iter=c.max_iter,
+            outputs=case.outputs,
+            flap=flap,
+        )
+    except InvalidGeometry as exc:
+        return CaseResult(
+            case=case,
+            status="error",
+            failure_kind="input",
+            summary={"error": str(exc)},
+            provenance=_provenance(case, time.monotonic() - started),
         )
     except XfoilError as exc:
         return CaseResult(
