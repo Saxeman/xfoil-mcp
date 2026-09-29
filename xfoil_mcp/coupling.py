@@ -12,6 +12,7 @@ surface, negative on the lower.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 
 @dataclass(frozen=True)
@@ -63,3 +64,141 @@ def stagnation_point(
         surface = "leading edge"
 
     return Stagnation(s=s_stag, x=at_crossing(x), y=at_crossing(y), index=i, surface=surface)
+
+# --- air and flight condition ----------------------------------------------
+
+@dataclass(frozen=True)
+class Air:
+    """Air properties, SI units. Ideal gas for density, Sutherland's law for
+    viscosity, a power-law fit for conductivity, constant cp. Good to a few
+    percent over the -40 to +40 C range icing cares about."""
+
+    rho: float      # density, kg/m^3
+    mu: float       # dynamic viscosity, Pa s
+    k: float        # thermal conductivity, W/m K
+    cp: float = 1006.0   # specific heat, J/kg K
+
+    @classmethod
+    def at(cls, temperature_k: float, pressure_pa: float = 101325.0) -> Air:
+        T = temperature_k
+        return cls(
+            rho=pressure_pa / (287.05 * T),
+            mu=1.458e-6 * T**1.5 / (T + 110.4),
+            k=0.0241 * (T / 273.15) ** 0.81,
+        )
+
+    @property
+    def nu(self) -> float:
+        """Kinematic viscosity, m^2/s."""
+        return self.mu / self.rho
+
+    @property
+    def pr(self) -> float:
+        """Prandtl number: how fast momentum spreads relative to heat. ~0.72 for air."""
+        return self.mu * self.cp / self.k
+
+
+def velocity_for(reynolds: float, chord_m: float, air: Air) -> float:
+    """The airspeed that gives this Reynolds number at this chord and air.
+
+    Derived rather than chosen, so the thermal model can never disagree
+    with the conditions XFOIL actually solved.
+    """
+    return reynolds * air.nu / chord_m
+
+
+# --- heat transfer coefficient -----------------------------------------------
+
+def _power_integral(u0: float, u1: float, ds: float) -> float:
+    """Exact integral of u^1.87 across a segment where u varies linearly.
+
+    A plain trapezoid is badly wrong on the first segment out of the
+    stagnation point, where u starts at zero: it overestimates this integral
+    by 44% and underestimates h there by about 17%.
+    """
+    if abs(u1 - u0) < 1e-12:
+        return u0**1.87 * ds
+    return ds * (u1**2.87 - u0**2.87) / (2.87 * (u1 - u0))
+
+
+def smith_spalding(distances: list[float], speeds: list[float], air: Air) -> list[float]:
+    """Laminar heat transfer coefficient along a surface, W/m^2 K.
+
+    distances: metres from the stagnation point, increasing.
+    speeds: edge velocity magnitude at each distance, m/s.
+
+    Thermal layer thickness from an integral of the edge speed, then
+    h = 2k / thickness. Accounts for acceleration, so it holds at the
+    stagnation point, where the Reynolds analogy does not. Reproduces the
+    flat-plate and cylinder-stagnation results to about 1%.
+    """
+    h: list[float] = []
+    integral, d_prev, u_prev = 0.0, 0.0, 0.0
+    for d, u in zip(distances, speeds):
+        integral += _power_integral(u_prev, u, d - d_prev)
+        thickness = math.sqrt(46.72 * air.nu * integral / u**2.87)
+        h.append(2 * air.k / thickness)
+        d_prev, u_prev = d, u
+    return h
+
+
+def reynolds_analogy(cf: float, ue_ratio: float, velocity: float, air: Air) -> float:
+    """Turbulent heat transfer coefficient from skin friction, W/m^2 K.
+
+    Heat and momentum are carried to the wall by the same mixing, so
+    St = (Cf/2) Pr^(-2/3), with Cf and St both based on the local edge
+    speed. XFOIL's Cf is based on the freestream speed (xoper.f:
+    CF = TAU/(0.5*QINF**2)), so wall shear is recovered from it first.
+    abs() because separated flow gives negative Cf; the analogy is weak
+    there, but heat still leaves.
+    """
+    wall_shear = abs(cf) * 0.5 * air.rho * velocity**2
+    edge_speed = abs(ue_ratio) * velocity
+    return air.cp * wall_shear * air.pr ** (-2 / 3) / edge_speed
+
+
+@dataclass(frozen=True)
+class HeatTransfer:
+    h: list[float]          # W/m^2 K, one per surface node
+    regime: list[str]       # "laminar" or "turbulent"
+
+
+def heat_transfer(
+    s: list[float], x: list[float], ue: list[float], cf: list[float],
+    stagnation: Stagnation, xtr_upper: float, xtr_lower: float,
+    chord_m: float, velocity: float, air: Air,
+) -> HeatTransfer:
+    """h along the whole surface, walking from the stagnation point to each tail.
+
+    Laminar (Smith-Spalding) until transition; turbulent (Reynolds analogy)
+    after. The turbulent value is never allowed below the laminar one: at the
+    transition node XFOIL's Cf is still at its laminar low, and turbulence
+    only increases heat transfer. A transition location of 1.0 means the
+    side stays laminar.
+    """
+    n = len(s)
+    le = min(range(n), key=x.__getitem__)
+    h = [0.0] * n
+    regime = [""] * n
+    sides = (
+        # upper side: stagnation node back to the upper tail; x only counts once past the tip
+        (list(range(stagnation.index, -1, -1)), xtr_upper, lambda i: i <= le),
+        # lower side: next node on to the lower tail
+        (list(range(stagnation.index + 1, n)), xtr_lower, lambda i: i >= le),
+    )
+    for nodes, xtr, past_tip in sides:
+        laminar = smith_spalding(
+            [abs(s[i] - stagnation.s) * chord_m for i in nodes],
+            [abs(ue[i]) * velocity for i in nodes],
+            air,
+        )
+        turbulent = False
+        for i, h_laminar in zip(nodes, laminar):
+            turbulent = turbulent or (xtr < 1.0 and past_tip(i) and x[i] >= xtr)
+            if turbulent:
+                h[i] = max(reynolds_analogy(cf[i], ue[i], velocity, air), h_laminar)
+                regime[i] = "turbulent"
+            else:
+                h[i] = h_laminar
+                regime[i] = "laminar"
+    return HeatTransfer(h=h, regime=regime)
