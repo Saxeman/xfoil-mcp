@@ -644,3 +644,7 @@ def test_design_without_geometry_says_how_to_get_it(printing, monkeypatch):
     out = call("request_print", content_hash=evaluated_design(monkeypatch, geometry=None))
     assert out["failure_kind"] == "input"
     assert "geometry" in out["errors"][0]
+
+def test_default_outbox_is_at_the_repository_root():
+    repo_root = Path(__file__).resolve().parent.parent
+    assert server._default_outbox() == repo_root / "outbox"

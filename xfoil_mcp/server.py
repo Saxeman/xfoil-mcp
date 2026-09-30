@@ -144,6 +144,16 @@ def _design_response(case, result) -> dict:
 
 # --- printing ----------------------------------------------------------------
 
+def _default_outbox():
+    """xfoil_outbox/ at the repository root, found from this file's location.
+
+    Not the working directory: Claude Desktop starts the server from one we
+    don't control. This file is <repo>/xfoil_mcp/server.py, so the repo root
+    is two levels up. XFOIL_PRINT_OUTBOX still overrides it.
+    """
+    from pathlib import Path
+    return Path(__file__).resolve().parent.parent / "outbox"
+
 def _printing():
     """Start the print queue and the approval page on first use.
 
@@ -159,7 +169,7 @@ def _printing():
         from xfoil_mcp.print_site import start_site
         from xfoil_mcp.printing import DryBackend, PrintQueue
 
-        outbox = Path(os.environ.get("XFOIL_PRINT_OUTBOX", Path.home() / "xfoil-mcp" / "outbox"))
+        outbox = Path(os.environ.get("XFOIL_PRINT_OUTBOX", _default_outbox()))
         port = int(os.environ.get("XFOIL_PRINT_PORT", "8765"))
         _print_queue = PrintQueue(DryBackend(outbox))
         _print_site, _print_base_url = start_site(_print_queue, port)
