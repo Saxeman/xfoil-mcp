@@ -8,3 +8,4 @@ venv/
 notes.txt
 useful.txt
 notes/
+outbox/
