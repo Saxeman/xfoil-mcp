@@ -55,6 +55,10 @@ _ARGUMENT_NAMES = {
 _AERO_HIDDEN = {"thermal", "airfoil", "reynolds", "field_outputs"}
 _THERMAL_SHOWN = ("status", "failure_kind", "errors", "coverage", "worst_case", "excluded")
 
+_designs: dict = {}          # evaluate_design results this session, by content hash
+_print_queue = None          # created on the first print request
+_print_site = None
+_print_base_url = None
 
 # --- envelope --------------------------------------------------------------
 
@@ -137,6 +141,41 @@ def _design_response(case, result) -> dict:
         return {"status": "partial", "failure_kind": "numerical", "retry_could_help": False,
                 "errors": [], **fields}
     return _ok(**fields)
+
+# --- printing ----------------------------------------------------------------
+
+def _printing():
+    """Start the print queue and the approval page on first use.
+
+    Imported lazily: CadQuery takes seconds to load, and the MCP server should
+    start instantly. The outbox defaults to a fixed folder because Claude
+    Desktop starts this server from an unpredictable working directory.
+    """
+    global _print_queue, _print_site, _print_base_url
+    if _print_queue is None:
+        import os
+        from pathlib import Path
+
+        from xfoil_mcp.print_site import start_site
+        from xfoil_mcp.printing import DryBackend, PrintQueue
+
+        outbox = Path(os.environ.get("XFOIL_PRINT_OUTBOX", Path.home() / "xfoil-mcp" / "outbox"))
+        port = int(os.environ.get("XFOIL_PRINT_PORT", "8765"))
+        _print_queue = PrintQueue(DryBackend(outbox))
+        _print_site, _print_base_url = start_site(_print_queue, port)
+    return _print_queue, _print_base_url
+
+
+def _find_design(content_hash: str):
+    """A design evaluated this session, or a case from the most recent campaign."""
+    if content_hash in _designs:
+        return _designs[content_hash]
+    if _last_batch is not None:
+        try:
+            return _last_batch.get(content_hash)
+        except KeyError:
+            return None
+    return None
 
 # --- tools -----------------------------------------------------------------
 
@@ -268,7 +307,7 @@ def evaluate_design(
             },
             "conditions": {"reynolds": reynolds, "alpha_start": alpha_start,
                            "alpha_end": alpha_end, "alpha_step": alpha_step},
-            "outputs": ["forces", "bl"],
+            "outputs": ["forces", "bl", "geometry"],
             "thermal": {
                 "chord_m": chord_m,
                 "air_temperature_k": air_temperature_c + 273.15,
@@ -280,7 +319,78 @@ def evaluate_design(
         })
     except ValidationError as exc:
         return _error("input", _argument_errors(exc), content_hash=None, stages=[], per_alpha=[])
-    return _design_response(case, harness.evaluate(case))
+    result = harness.evaluate(case)
+    _designs[case.content_hash()] = result
+    return _design_response(case, result)
+
+
+
+@mcp.tool
+def request_print(content_hash: str) -> dict:
+    """Prepare a printed section of a design and ask the user to approve it.
+
+    content_hash comes from evaluate_design (or from a campaign whose cases
+    included "geometry" in outputs). Builds the part from the exact outline
+    XFOIL analysed, then opens a review page on the user's machine showing
+    the part in 3D, its stats, and the file's hash.
+
+    This does NOT print anything. Give the user the url and ask them to
+    review and approve the part there. Only the user can approve, on that
+    page; never say it is approved unless they tell you so. When they
+    confirm, call start_print with the request_id.
+    """
+    result = _find_design(content_hash)
+    if result is None:
+        return _error("input", [f"no evaluated design {content_hash!r} in this session"])
+    geometry = (result.data or {}).get("geometry")
+    if not geometry:
+        return _error("input", ["this design has no geometry; evaluate it with evaluate_design, "
+                                "or include \"geometry\" in the campaign's outputs"])
+
+    from xfoil_mcp.cad import CadError, build_section
+    try:
+        part = build_section([tuple(p) for p in geometry])
+    except CadError as exc:
+        return _error("input", [str(exc)])
+
+    case = result.case
+    flap = case.geometry.flap
+    thermal = (result.summary or {}).get("thermal") or {}
+    design = {
+        "label": case.label or f"NACA {case.geometry.naca}",
+        "airfoil": case.geometry.naca,
+        "flap": "none" if flap is None else f"{flap.deflection:g} deg at {flap.x_hinge:.0%} chord",
+        "reynolds": f"{case.conditions.reynolds:g}",
+        "coldest_heater_temperature_c": (thermal.get("worst_case") or {}).get("min_heated_temperature_c"),
+        "design_hash": content_hash[:12],
+    }
+    queue, base = _printing()
+    request = queue.create(design, part)
+    return _ok(request_id=request.id, url=f"{base}/print/{request.id}",
+               sha256=part.sha256[:12], stats=part.stats, print_status=request.status)
+
+
+@mcp.tool
+def start_print(request_id: str) -> dict:
+    """Send an approved print request to the printer.
+
+    Refuses unless the user has approved this request on its review page,
+    for the exact file shown there. If it is still awaiting approval, ask
+    the user to approve it at the url from request_print, then try again.
+    An approval is used once and expires after 30 minutes.
+    """
+    from xfoil_mcp.printing import PrintRefused
+
+    queue, _ = _printing()
+    try:
+        sent = queue.start(request_id)
+    except PrintRefused as exc:
+        try:
+            status = queue.get(request_id).status
+        except PrintRefused:
+            status = None
+        return _error("input", [str(exc)], request_id=request_id, print_status=status)
+    return _ok(request_id=request_id, print_status="sent", **sent)
 
 @mcp.tool
 def dry_run_campaign(source: str) -> dict:

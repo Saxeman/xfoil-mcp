@@ -31,8 +31,9 @@ from xfoil_mcp import harness, server
 from xfoil_mcp.schema import Case, CaseResult, Conditions, Geometry
 
 ENVELOPE = {"status", "failure_kind", "retry_could_help", "errors"}
-TOOLS = {"run_polar", "dry_run_campaign", "run_campaign", "get_case_detail", "evaluate_design"}
 
+TOOLS = {"run_polar", "dry_run_campaign", "run_campaign", "get_case_detail",
+         "evaluate_design", "request_print", "start_print"}
 
 # --- plumbing --------------------------------------------------------------
 
@@ -563,3 +564,83 @@ def test_partial_thermal_coverage_makes_the_design_partial(monkeypatch):
     out = call("evaluate_design", **DESIGN)
     assert out["status"] == "partial"
     assert out["stages"][1]["coverage"] == 0.5
+
+# ==========================================================================
+# 7. printing
+# ==========================================================================
+
+from pathlib import Path
+
+OUTLINE = [[float(v) for v in line.split()]
+           for line in (Path(__file__).parent / "fixtures" / "naca2412_flap_10.dat").read_text().splitlines()
+           if line.strip()]
+
+
+@pytest.fixture
+def printing(monkeypatch, tmp_path):
+    """A fresh print queue per test, writing to a temp outbox, on a free port."""
+    pytest.importorskip("cadquery")
+    monkeypatch.setenv("XFOIL_PRINT_OUTBOX", str(tmp_path / "outbox"))
+    monkeypatch.setenv("XFOIL_PRINT_PORT", "0")
+    monkeypatch.setattr(server, "_designs", {})
+    monkeypatch.setattr(server, "_print_queue", None)
+    monkeypatch.setattr(server, "_print_site", None)
+    yield tmp_path / "outbox"
+    if server._print_site is not None:
+        server._print_site.shutdown()
+        server._print_site.server_close()
+
+
+def evaluated_design(monkeypatch, geometry=OUTLINE) -> str:
+    """Run evaluate_design against a fake harness whose result carries an outline."""
+    def fake(case, timeout=180.0):
+        result = design_result(case)
+        data = dict(result.data)
+        if geometry is not None:
+            data["geometry"] = geometry
+        return result.model_copy(update={"data": data})
+
+    monkeypatch.setattr(server.harness, "evaluate", fake)
+    return call("evaluate_design", **DESIGN)["content_hash"]
+
+
+def test_print_request_for_an_unknown_design_is_refused(printing):
+    out = call("request_print", content_hash="nope")
+    assert out["failure_kind"] == "input"
+
+
+def test_print_request_returns_a_local_review_url(printing, monkeypatch):
+    out = call("request_print", content_hash=evaluated_design(monkeypatch))
+    assert out["status"] == "ok"
+    assert out["print_status"] == "pending"
+    assert out["url"].startswith("http://127.0.0.1:")
+    assert out["request_id"] in out["url"]
+
+
+def test_start_print_before_approval_is_refused(printing, monkeypatch):
+    request = call("request_print", content_hash=evaluated_design(monkeypatch))
+    out = call("start_print", request_id=request["request_id"])
+    assert out["status"] == "error"
+    assert out["print_status"] == "pending"
+    assert "approv" in out["errors"][0]
+
+
+def test_after_the_person_approves_the_print_is_sent_once(printing, monkeypatch):
+    request = call("request_print", content_hash=evaluated_design(monkeypatch))
+    queue = server._print_queue
+    part = queue.get(request["request_id"]).part
+    queue.approve(request["request_id"], part.sha256)       # what the page does when you click
+
+    out = call("start_print", request_id=request["request_id"])
+    assert out["status"] == "ok"
+    assert Path(out["stl_path"]).read_bytes() == part.stl
+
+    again = call("start_print", request_id=request["request_id"])
+    assert again["status"] == "error"
+    assert again["print_status"] == "sent"
+
+
+def test_design_without_geometry_says_how_to_get_it(printing, monkeypatch):
+    out = call("request_print", content_hash=evaluated_design(monkeypatch, geometry=None))
+    assert out["failure_kind"] == "input"
+    assert "geometry" in out["errors"][0]
