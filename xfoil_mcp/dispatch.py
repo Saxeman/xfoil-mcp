@@ -11,10 +11,24 @@ from __future__ import annotations
 import os
 import subprocess
 import uuid
+import json
 
 from xfoil_mcp.schema import Case, CaseResult
 
 WORKER_IMAGE = os.environ.get("XFOIL_WORKER_IMAGE", "xfoil-worker")
+THERMAL_IMAGE = os.environ.get("XFOIL_THERMAL_IMAGE", "xfoil-thermal")
+
+# Same isolation as the sandbox: the code is ours, but its input crossed a
+# container boundary on its way here.
+THERMAL_FLAGS = [
+    "--network", "none",
+    "--read-only", "--tmpfs", "/tmp:size=64m",
+    "--memory", "1g", "--cpus", "1", "--pids-limit", "64",
+    "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+    "--user", "65534:65534",
+]
+THERMAL_KEYS = {"status", "failure_kind", "errors", "coverage", "worst_case", "points", "excluded"}
+STATUSES = {"ok", "partial", "empty", "error"}
 
 
 def _infrastructure_failure(case: Case, message: str) -> CaseResult:
@@ -25,6 +39,49 @@ def _infrastructure_failure(case: Case, message: str) -> CaseResult:
         summary={"error": message},
         provenance={"content_hash": case.content_hash(), "image": WORKER_IMAGE},
     )
+
+def _thermal_failure(message: str) -> dict:
+    return {
+        "status": "error", "failure_kind": "infrastructure", "errors": [message],
+        "coverage": 0.0, "worst_case": None, "points": [], "excluded": [],
+    }
+
+
+def run_thermal(aero: CaseResult, timeout: float = 120.0) -> dict:
+    """Run the thermal stage for one finished aero result in a fresh container.
+
+    Never raises. The output is checked here because it crossed a container
+    boundary: the expected fields, a known status, and a content hash that
+    matches the case that was sent.
+    """
+    name = f"xfoil-thermal-{uuid.uuid4().hex[:12]}"
+    cmd = ["docker", "run", "--rm", "-i", "--name", name, *THERMAL_FLAGS, THERMAL_IMAGE]
+    try:
+        try:
+            proc = subprocess.run(
+                cmd, input=aero.model_dump_json(), capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return _thermal_failure(f"thermal worker exceeded {timeout}s and was killed")
+        except FileNotFoundError:
+            return _thermal_failure("docker not found on host")
+
+        if proc.returncode != 0:
+            return _thermal_failure(f"thermal worker exited {proc.returncode}: {proc.stderr.strip()[-500:]}")
+        try:
+            out = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return _thermal_failure(f"thermal output was not JSON: {proc.stdout[:200]!r}")
+
+        if not isinstance(out, dict) or not THERMAL_KEYS <= out.keys() or out["status"] not in STATUSES:
+            return _thermal_failure("thermal output did not have the expected shape")
+        if out["status"] != "error" and out.get("content_hash") != aero.case.content_hash():
+            return _thermal_failure("thermal worker returned a result for a different case")
+        return out
+    finally:
+        rm = subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True, timeout=15)
+        if rm.returncode != 0 and "No such container" not in rm.stderr:
+            logging.getLogger(__name__).warning("failed to remove %s: %s", name, rm.stderr.strip())
 
 
 def run_case(case: Case, timeout: float = 180.0) -> CaseResult:
