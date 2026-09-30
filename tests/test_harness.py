@@ -11,13 +11,18 @@ import pytest
 from xfoil_mcp import harness, sandbox
 from xfoil_mcp.schema import Case, CaseResult, Conditions, Geometry
 
+from builders import THERMAL
 
-def make_case(naca="2412", reynolds=1e6, label=None) -> Case:
+
+def make_case(naca="2412", reynolds=1e6, label=None, thermal=None) -> Case:
     return Case(
         geometry=Geometry(naca=naca),
         conditions=Conditions(reynolds=reynolds, alpha_start=0, alpha_end=10, alpha_step=1),
+        outputs=("forces", "bl") if thermal else ("forces",),
         label=label,
+        thermal=thermal,
     )
+
 
 
 def fake_sandbox(cases, errors=(), rejected=(), killed=False):
@@ -145,3 +150,67 @@ def test_get_returns_full_result(monkeypatch):
     assert full is not None
     assert full.data == {"points": ["would be large"]}
     assert batch.get("nope") is None
+
+# --- thermal chaining -------------------------------------------------------
+
+def fake_thermal(calls):
+    """Stand in for dispatch.run_thermal, recording which aero results it was given."""
+    def _run(aero, timeout=180.0):
+        calls.append(aero)
+        return {
+            "status": "ok", "failure_kind": None, "errors": [], "coverage": 1.0,
+            "worst_case": {"min_heated_temperature_c": 24.8, "at_alpha": 4.0},
+            "points": [{"alpha": 4.0}], "excluded": [], "heater_power_w_per_m": 500.0,
+            "content_hash": aero.case.content_hash(),
+        }
+    return _run
+
+
+def test_case_without_thermal_never_launches_the_thermal_stage(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sandbox, "run_campaign_source", fake_sandbox([make_case()]))
+    monkeypatch.setattr(harness.dispatch, "run_case", fake_dispatch({}))
+    monkeypatch.setattr(harness.dispatch, "run_thermal", fake_thermal(calls))
+    batch = harness.submit("src", harness.dry_run("src").approval_hash)
+    assert calls == []
+    assert "thermal" not in batch.summaries()[0]
+
+
+def test_thermal_case_runs_thermal_on_its_own_aero_result(monkeypatch):
+    calls = []
+    case = make_case(thermal=THERMAL)
+    monkeypatch.setattr(sandbox, "run_campaign_source", fake_sandbox([case]))
+    monkeypatch.setattr(harness.dispatch, "run_case", fake_dispatch({}))
+    monkeypatch.setattr(harness.dispatch, "run_thermal", fake_thermal(calls))
+    batch = harness.submit("src", harness.dry_run("src").approval_hash)
+
+    assert len(calls) == 1 and calls[0].case == case
+    summary = batch.summaries()[0]
+    assert summary["thermal"]["status"] == "ok"
+    assert summary["thermal"]["worst_case"]["min_heated_temperature_c"] == 24.8
+    assert "points" not in summary["thermal"]                       # verdict only
+    assert batch.get(case.content_hash()).data["thermal"]["points"] == [{"alpha": 4.0}]
+
+
+def test_failed_aero_is_not_sent_to_the_thermal_stage(monkeypatch):
+    calls = []
+    case = make_case(naca="4412", thermal=THERMAL)
+    monkeypatch.setattr(sandbox, "run_campaign_source", fake_sandbox([case]))
+    monkeypatch.setattr(harness.dispatch, "run_case", fake_dispatch({"4412": ("error", "infrastructure")}))
+    monkeypatch.setattr(harness.dispatch, "run_thermal", fake_thermal(calls))
+    batch = harness.submit("src", harness.dry_run("src").approval_hash)
+
+    assert calls == []
+    thermal = batch.summaries()[0]["thermal"]
+    assert thermal["status"] == "error"
+    assert thermal["failure_kind"] == "input"
+    assert "upstream" in thermal["errors"][0]
+
+
+def test_estimate_prices_the_thermal_stage(monkeypatch):
+    monkeypatch.setattr(sandbox, "run_campaign_source", fake_sandbox([make_case()]))
+    plain = harness.dry_run("src").estimate
+    monkeypatch.setattr(sandbox, "run_campaign_source", fake_sandbox([make_case(thermal=THERMAL)]))
+    heated = harness.dry_run("src").estimate
+    assert heated.thermal_cases == 1
+    assert heated.expected_seconds > plain.expected_seconds

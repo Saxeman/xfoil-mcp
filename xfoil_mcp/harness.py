@@ -22,6 +22,13 @@ from xfoil_mcp.schema import Case, CaseResult
 SECONDS_PER_CONTAINER = 1.5
 SECONDS_PER_ALPHA_POINT = 0.05
 
+SECONDS_PER_THERMAL_CONTAINER = 1.5
+SECONDS_PER_THERMAL_POINT = 0.1
+# The part of a thermal result the model reads. Per-alpha points stay in
+# data, reachable through get_case_detail.
+THERMAL_SUMMARY_KEYS = (
+    "status", "failure_kind", "errors", "coverage", "worst_case", "excluded", "heater_power_w_per_m",
+)
 
 class ApprovalMismatch(Exception):
     """The campaign changed since it was approved, or was never approved."""
@@ -32,6 +39,7 @@ class Estimate:
     case_count: int
     alpha_points: int
     expected_seconds: float
+    thermal_cases: int = 0
 
 
 @dataclass
@@ -102,12 +110,37 @@ def _dedup(cases: list[Case]) -> list[Case]:
             out.append(c)
     return out
 
-
 def _estimate(cases: list[Case]) -> Estimate:
+    """Priced as if every alpha passes every gate: the most the run can cost."""
     points = sum(c.conditions.point_count() for c in cases)
-    seconds = len(cases) * SECONDS_PER_CONTAINER + points * SECONDS_PER_ALPHA_POINT
-    return Estimate(case_count=len(cases), alpha_points=points, expected_seconds=round(seconds, 1))
+    thermal = [c for c in cases if c.thermal is not None]
+    thermal_points = sum(c.conditions.point_count() for c in thermal)
+    seconds = (
+        len(cases) * SECONDS_PER_CONTAINER + points * SECONDS_PER_ALPHA_POINT
+        + len(thermal) * SECONDS_PER_THERMAL_CONTAINER + thermal_points * SECONDS_PER_THERMAL_POINT
+    )
+    return Estimate(case_count=len(cases), alpha_points=points,
+                    expected_seconds=round(seconds, 1), thermal_cases=len(thermal))
 
+def _with_thermal(aero: CaseResult, timeout: float) -> CaseResult:
+    """Run the thermal stage on a finished aero result and attach it.
+
+    The aero gate is checked here first: a failed aero result never
+    launches a thermal container. The model's summary gets the verdict;
+    the per-alpha detail goes to data.
+    """
+    if aero.status in ("error", "empty"):
+        thermal = {
+            "status": "error", "failure_kind": "input",
+            "errors": [f"upstream aero stage did not pass (status {aero.status})"],
+            "coverage": 0.0, "worst_case": None, "points": [], "excluded": [],
+        }
+    else:
+        thermal = dispatch.run_thermal(aero, timeout=timeout)
+
+    summary = {**aero.summary, "thermal": {k: thermal.get(k) for k in THERMAL_SUMMARY_KEYS}}
+    data = {**(aero.data or {}), "thermal": thermal}
+    return aero.model_copy(update={"summary": summary, "data": data})
 
 def _approval_hash(cases: list[Case]) -> str:
     joined = "\n".join(c.content_hash() for c in cases)
@@ -147,5 +180,10 @@ def submit(source: str, approval_hash: str, case_timeout: float = 180.0) -> Batc
             f"{report.approval_hash}; re-run dry_run and approve again"
         )
 
-    results = [dispatch.run_case(c, timeout=case_timeout) for c in report.cases]
+    results = []
+    for case in report.cases:
+        result = dispatch.run_case(case, timeout=case_timeout)
+        if case.thermal is not None:
+            result = _with_thermal(result, case_timeout)
+        results.append(result)
     return BatchResult(results=results, approval_hash=approval_hash)
