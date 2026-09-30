@@ -146,6 +146,13 @@ def _approval_hash(cases: list[Case]) -> str:
     joined = "\n".join(c.content_hash() for c in cases)
     return hashlib.sha256(joined.encode()).hexdigest()[:16]
 
+def evaluate(case: Case, timeout: float = 180.0) -> CaseResult:
+    """Run every stage a case asks for, in order: aero, then thermal if it has a heater."""
+    result = dispatch.run_case(case, timeout=timeout)
+    if case.thermal is not None:
+        result = _with_thermal(result, timeout)
+    return result
+
 
 def dry_run(source: str, timeout: float = 30.0) -> DryRunReport:
     outcome = sandbox.run_campaign_source(source, timeout=timeout)
@@ -180,10 +187,5 @@ def submit(source: str, approval_hash: str, case_timeout: float = 180.0) -> Batc
             f"{report.approval_hash}; re-run dry_run and approve again"
         )
 
-    results = []
-    for case in report.cases:
-        result = dispatch.run_case(case, timeout=case_timeout)
-        if case.thermal is not None:
-            result = _with_thermal(result, case_timeout)
-        results.append(result)
+    results = [evaluate(case, timeout=case_timeout) for case in report.cases]
     return BatchResult(results=results, approval_hash=approval_hash)

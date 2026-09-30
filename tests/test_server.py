@@ -31,7 +31,7 @@ from xfoil_mcp import harness, server
 from xfoil_mcp.schema import Case, CaseResult, Conditions, Geometry
 
 ENVELOPE = {"status", "failure_kind", "retry_could_help", "errors"}
-TOOLS = {"run_polar", "dry_run_campaign", "run_campaign", "get_case_detail"}
+TOOLS = {"run_polar", "dry_run_campaign", "run_campaign", "get_case_detail", "evaluate_design"}
 
 
 # --- plumbing --------------------------------------------------------------
@@ -119,7 +119,7 @@ def no_dispatch(monkeypatch):
 # 1. registration
 # ==========================================================================
 
-def test_exactly_four_tools_are_registered():
+def test_expected_tools_are_registered():
     assert set(list_tools()) == TOOLS
 
 
@@ -463,3 +463,103 @@ def test_host_modules_never_print_to_stdout(module):
         stripped = line.strip()
         if stripped.startswith("print(") and "file=sys.stderr" not in stripped:
             pytest.fail(f"{module}.py:{lineno} prints to stdout: {stripped}")
+
+# ==========================================================================
+# 6. evaluate_design
+# ==========================================================================
+
+DESIGN = dict(airfoil="2412", reynolds=1e6, chord_m=0.5, air_temperature_c=-10.0,
+              heater_power_w_per_m=500.0)
+
+
+def design_result(case, aero_status="ok", thermal=None):
+    """A harness.evaluate result shaped like the real one."""
+    kind = None if aero_status == "ok" else (
+        "numerical" if aero_status in ("partial", "empty") else "infrastructure")
+    thermal = thermal or {
+        "status": "ok", "failure_kind": None, "errors": [], "coverage": 1.0,
+        "worst_case": {"min_heated_temperature_c": 19.5, "at_alpha": 10.0},
+        "points": [{"alpha": 0.0, "min_heated_temperature_c": 25.7,
+                    "ice_free_upper_mm": 116.6, "ice_free_lower_mm": 125.4}],
+        "excluded": [],
+    }
+    data = None if aero_status in ("error", "empty") else {
+        "points": [{"alpha": 0.0, "cl": 0.2371, "cd": 0.00564, "top_xtr": 0.652}],
+        "thermal": thermal,
+    }
+    return CaseResult(
+        case=case, status=aero_status, failure_kind=kind,
+        summary={"converged_points": 1, "requested_points": 1, "best_ld": 42.0,
+                 "error": None if aero_status != "error" else "worker exceeded 180s"},
+        data=data,
+    )
+
+
+def capture_evaluate(monkeypatch, **kw):
+    """Replace harness.evaluate, keeping the Case the tool built."""
+    seen = {}
+
+    def fake(case, timeout=180.0):
+        seen["case"] = case
+        return design_result(case, **kw)
+
+    monkeypatch.setattr(server.harness, "evaluate", fake)
+    return seen
+
+
+def test_design_arguments_become_the_case_in_schema_units(monkeypatch):
+    seen = capture_evaluate(monkeypatch)
+    call("evaluate_design", **DESIGN, skin_thickness_mm=2.0, flap_deflection_deg=10.0)
+    case = seen["case"]
+    assert case.thermal.air_temperature_k == pytest.approx(263.15)
+    assert case.thermal.skin_thickness_m == pytest.approx(0.002)
+    assert case.geometry.flap.deflection == 10.0 and case.geometry.flap.x_hinge == 0.7
+    assert "bl" in case.outputs
+
+
+def test_no_flap_argument_means_no_flap(monkeypatch):
+    seen = capture_evaluate(monkeypatch)
+    call("evaluate_design", **DESIGN)
+    assert seen["case"].geometry.flap is None
+
+
+def test_design_errors_name_the_arguments_the_caller_used(monkeypatch):
+    monkeypatch.setattr(server.harness, "evaluate",
+                        lambda c, timeout=180.0: pytest.fail("evaluated an invalid design"))
+    out = call("evaluate_design", **{**DESIGN, "airfoil": "24a2",
+                                     "air_temperature_c": -150.0, "heater_power_w_per_m": -5.0})
+    assert out["failure_kind"] == "input"
+    joined = "\n".join(out["errors"])
+    assert "airfoil:" in joined
+    assert "air_temperature_c" in joined
+    assert "heater_power_w_per_m:" in joined
+
+
+def test_design_returns_a_stage_trace_and_per_alpha_table(monkeypatch):
+    capture_evaluate(monkeypatch)
+    out = call("evaluate_design", **DESIGN)
+    assert out["status"] == "ok"
+    assert [s["stage"] for s in out["stages"]] == ["aero", "thermal"]
+    assert out["stages"][1]["worst_case"]["at_alpha"] == 10.0
+    row = out["per_alpha"][0]
+    assert row["cl"] == 0.2371 and row["ice_free_upper_mm"] == 116.6
+
+
+def test_failed_aero_means_thermal_is_not_run(monkeypatch):
+    capture_evaluate(monkeypatch, aero_status="error")
+    out = call("evaluate_design", **DESIGN)
+    assert out["status"] == "error"
+    assert out["failure_kind"] == "infrastructure"
+    assert out["retry_could_help"] is True
+    assert out["stages"][1]["status"] == "not_run"
+
+
+def test_partial_thermal_coverage_makes_the_design_partial(monkeypatch):
+    capture_evaluate(monkeypatch, thermal={
+        "status": "partial", "failure_kind": "numerical", "errors": [], "coverage": 0.5,
+        "worst_case": None, "points": [],
+        "excluded": [{"alpha": 2.0, "reason": "aero did not converge"}],
+    })
+    out = call("evaluate_design", **DESIGN)
+    assert out["status"] == "partial"
+    assert out["stages"][1]["coverage"] == 0.5

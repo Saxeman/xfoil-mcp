@@ -34,6 +34,27 @@ mcp = FastMCP("xfoil")
 # implementation would put this in a store keyed by batch id.
 _last_batch: harness.BatchResult | None = None
 
+# Validation errors name schema fields; the caller used tool arguments. Say
+# which argument was wrong, in the caller's own terms.
+_ARGUMENT_NAMES = {
+    "geometry.naca": "airfoil",
+    "geometry.flap.x_hinge": "flap_hinge",
+    "geometry.flap.deflection": "flap_deflection_deg",
+    "conditions.reynolds": "reynolds",
+    "conditions.alpha_start": "alpha_start",
+    "conditions.alpha_end": "alpha_end",
+    "conditions.alpha_step": "alpha_step",
+    "thermal.chord_m": "chord_m",
+    "thermal.air_temperature_k": "air_temperature_c (checked in kelvin)",
+    "thermal.heater_width": "heater_width",
+    "thermal.heater_power_w_per_m": "heater_power_w_per_m",
+    "thermal.skin_thickness_m": "skin_thickness_mm (checked in metres)",
+    "thermal.skin_conductivity_w_mk": "skin_conductivity_w_mk",
+}
+
+_AERO_HIDDEN = {"thermal", "airfoil", "reynolds", "field_outputs"}
+_THERMAL_SHOWN = ("status", "failure_kind", "errors", "coverage", "worst_case", "excluded")
+
 
 # --- envelope --------------------------------------------------------------
 
@@ -69,6 +90,53 @@ def _case_view(cases: list[Case]) -> list[dict]:
         for c in cases
     ]
 
+def _argument_errors(exc: ValidationError) -> list[str]:
+    out = []
+    for e in exc.errors():
+        location = ".".join(str(p) for p in e["loc"])
+        out.append(f"{_ARGUMENT_NAMES.get(location, location)}: {e['msg']}")
+    return out
+
+
+def _per_alpha(result) -> list[dict]:
+    """Aero and thermal results side by side, one row per converged alpha."""
+    data = result.data or {}
+    thermal = {round(p["alpha"], 3): p for p in (data.get("thermal") or {}).get("points", [])}
+    rows = []
+    for p in data.get("points", []):
+        t = thermal.get(round(p["alpha"], 3), {})
+        rows.append({
+            "alpha": p["alpha"], "cl": p["cl"], "cd": p["cd"], "upper_transition": p["top_xtr"],
+            "min_heated_temperature_c": t.get("min_heated_temperature_c"),
+            "ice_free_upper_mm": t.get("ice_free_upper_mm"),
+            "ice_free_lower_mm": t.get("ice_free_lower_mm"),
+        })
+    return rows
+
+
+def _design_response(case, result) -> dict:
+    """The stage trace. Overall status comes from the first stage that did not pass."""
+    aero = {"stage": "aero", "status": result.status, "failure_kind": result.failure_kind,
+            **{k: v for k, v in result.summary.items() if k not in _AERO_HIDDEN}}
+    if result.status in ("error", "empty"):
+        thermal = {"stage": "thermal", "status": "not_run",
+                   "reason": f"aero stage did not pass (status {result.status})"}
+    else:
+        raw = (result.data or {}).get("thermal") or {}
+        thermal = {"stage": "thermal", **{k: raw.get(k) for k in _THERMAL_SHOWN}}
+    fields = dict(content_hash=case.content_hash(), stages=[aero, thermal],
+                  per_alpha=_per_alpha(result))
+
+    if result.status in ("error", "empty"):
+        return _error(result.failure_kind or "numerical",
+                      [result.summary.get("error") or f"aero stage returned {result.status}"], **fields)
+    if thermal["status"] == "error":
+        return _error(thermal["failure_kind"] or "infrastructure",
+                      thermal["errors"] or ["thermal stage failed"], **fields)
+    if "partial" in (result.status, thermal["status"]) or thermal["status"] == "empty":
+        return {"status": "partial", "failure_kind": "numerical", "retry_could_help": False,
+                "errors": [], **fields}
+    return _ok(**fields)
 
 # --- tools -----------------------------------------------------------------
 
@@ -138,6 +206,81 @@ def run_polar(
         **result.summary,
     }
 
+
+
+
+@mcp.tool
+def evaluate_design(
+    airfoil: str,
+    reynolds: float,
+    chord_m: float,
+    air_temperature_c: float,
+    heater_power_w_per_m: float,
+    heater_width: float = 0.1,
+    skin_thickness_mm: float = 1.0,
+    skin_conductivity_w_mk: float = 200.0,
+    flap_deflection_deg: float | None = None,
+    flap_hinge: float = 0.7,
+    alpha_start: float = 0.0,
+    alpha_end: float = 10.0,
+    alpha_step: float = 2.0,
+) -> dict:
+    """Evaluate one wing section with a leading-edge heater: XFOIL aerodynamics,
+    then skin temperature from a heater centred on the stagnation point.
+
+    Use this for a single design. To compare many designs or sample a design
+    space, write a campaign with a thermal block and use dry_run_campaign.
+
+    airfoil: NACA 4- or 5-digit, e.g. "2412".
+    reynolds: chord Reynolds number. Airspeed is derived from this, the chord
+        and the air, so it is not an argument.
+    chord_m: wing chord in metres.
+    air_temperature_c: freestream air temperature in Celsius, e.g. -10.
+    heater_power_w_per_m: total heater power per metre of span.
+    heater_width: heater band width as a fraction of chord (0.1 = 10%).
+    skin_thickness_mm, skin_conductivity_w_mk: about 200 for aluminium,
+        about 1 for carbon composite. Aluminium spreads heat far beyond the
+        band; composite keeps it near the band and runs much hotter.
+    flap_deflection_deg: omit for no flap; positive is trailing edge down.
+    alpha_start, alpha_end, alpha_step: the sweep, in degrees.
+
+    Returns a stage-by-stage trace (aero, then thermal) and a per-alpha table
+    with lift coefficient, upper-surface transition, coldest temperature in
+    the heater, and ice-free extent on each side. If aero fails, thermal is
+    not run and the trace says why.
+
+    The thermal worst_case takes the worst of each field across alphas, so
+    its numbers can come from different angles. Coverage is converged alphas
+    over requested: below 1.0, the hardest angles are missing from the worst
+    case. To compare a flapped and unflapped design fairly, compare at equal
+    lift coefficient (cl in per_alpha), not equal angle: a flap makes lift
+    without raising the nose, which keeps transition further back.
+
+    Model limits to state when reporting: 2D, steady, dry air (no droplets
+    or evaporation, so it underestimates the power a real heater needs).
+    """
+    try:
+        case = Case.model_validate({
+            "geometry": {
+                "naca": airfoil,
+                "flap": None if flap_deflection_deg is None
+                        else {"x_hinge": flap_hinge, "deflection": flap_deflection_deg},
+            },
+            "conditions": {"reynolds": reynolds, "alpha_start": alpha_start,
+                           "alpha_end": alpha_end, "alpha_step": alpha_step},
+            "outputs": ["forces", "bl"],
+            "thermal": {
+                "chord_m": chord_m,
+                "air_temperature_k": air_temperature_c + 273.15,
+                "heater_width": heater_width,
+                "heater_power_w_per_m": heater_power_w_per_m,
+                "skin_thickness_m": skin_thickness_mm / 1000.0,
+                "skin_conductivity_w_mk": skin_conductivity_w_mk,
+            },
+        })
+    except ValidationError as exc:
+        return _error("input", _argument_errors(exc), content_hash=None, stages=[], per_alpha=[])
+    return _design_response(case, harness.evaluate(case))
 
 @mcp.tool
 def dry_run_campaign(source: str) -> dict:
