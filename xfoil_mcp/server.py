@@ -408,10 +408,17 @@ def dry_run_campaign(source: str) -> dict:
     WOULD run. Runs no solver. Always call this before run_campaign.
 
     A campaign is Python source defining `campaign() -> list[Case]`. It may
-    import only xfoil_mcp.schema (Case, Geometry, Flap, Conditions), numpy,
-    and scipy. Use scipy.stats.qmc for Latin hypercube or Sobol sampling
+    import only xfoil_mcp.schema (Case, Geometry, Flap, Conditions, Thermal),
+    numpy, and scipy. Use scipy.stats.qmc for Latin hypercube or Sobol sampling
     rather than writing a sampler by hand, and seed it. The sandbox has no
     network and a 30 second limit.
+
+    Each Case can set outputs: "forces" (default), "bl", "cp", "geometry".
+    Add "geometry" to any case you might want to print (request_print needs
+    it). A Case with a thermal=Thermal(...) block runs the heater analysis
+    after XFOIL and requires "bl" in outputs. Thermal cases cost roughly five
+    times more than aero-only; screen with aero first, add thermal to a
+    shortlist.
 
     Example:
 
@@ -420,7 +427,8 @@ def dry_run_campaign(source: str) -> dict:
             return [
                 Case(geometry=Geometry(naca=n),
                      conditions=Conditions(reynolds=5e5, alpha_start=0,
-                                           alpha_end=12, alpha_step=1),
+                                           alpha_end=12, alpha_step=1,
+                                           outputs=("forces", "geometry")),
                      label=n)
                 for n in ("2412", "4412", "0012")
             ]
