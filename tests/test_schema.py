@@ -42,6 +42,9 @@ def test_flap_bounds():
     with pytest.raises(ValidationError):
         Flap(x_hinge=0.7, deflection=60)
 
+def test_geometry_is_an_output():
+    assert "geometry" in make_case(outputs=("forces", "geometry")).outputs
+
 
 # --- conditions ------------------------------------------------------------
 

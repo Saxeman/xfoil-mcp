@@ -55,3 +55,7 @@ def test_hinge_outside_the_airfoil_is_an_input_failure():
     assert "outside the airfoil" in result.summary["error"]
     assert result.failure_kind == "input"
     assert result.retry_could_help is False
+
+def test_geometry_reaches_the_result():
+    result = run_case(case(outputs=("forces", "geometry"), flap=Flap(x_hinge=0.7, deflection=10)))
+    assert len(result.data["geometry"]) == 160

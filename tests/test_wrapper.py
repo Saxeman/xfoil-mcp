@@ -217,3 +217,10 @@ def test_march_failures_are_reported_as_a_number():
     summary = run_polar("2412", 1e6, 0, 4, 2).summary()
     assert isinstance(summary["march_failures"], int)
     assert summary["march_failures"] >= 0
+
+def test_geometry_is_the_outline_xfoil_analysed():
+    """Same outline as the step 16 hand export, point for point."""
+    from test_parsers import COORDS_FLAP
+    from xfoil_mcp.wrapper import _parse_coords_file
+    result = run_polar("2412", 1e6, 0, 0, 1, outputs=("geometry",), flap=(0.7, 0.0, 10.0))
+    assert result.geometry == _parse_coords_file(COORDS_FLAP)

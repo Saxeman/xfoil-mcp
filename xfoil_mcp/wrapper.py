@@ -163,6 +163,7 @@ class PolarResult:
     bl: dict[float, BoundaryLayer] = field(default_factory=dict)   # converged alphas only
     cp: dict[float, CpDistribution] = field(default_factory=dict)   # converged alphas only
     march_failures: int = 0
+    geometry: list[tuple[float, float]] | None = None   # the analysed outline, chord fractions
 
     @property
     def converged_count(self) -> int:
@@ -283,6 +284,10 @@ def _build_commands(
             "",                                        # leave GDES
             "PANE",                                    # repanel: EXEC keeps the buffer's own points
         ]
+    if "geometry" in outputs:
+        # The outline as XFOIL will analyse it: after any flap and repanel,
+        # before any solve. Written once; valid whether or not alphas converge.
+        lines.append("PSAV geometry.txt")
 
     lines += [
         "OPER",
@@ -444,6 +449,30 @@ def _parse_cp_file(path: Path, alpha: float) -> CpDistribution | None:
     if not xs:
         return None
     return CpDistribution(alpha=alpha, x=xs, cp=cps)
+
+def _parse_coords_file(path: Path) -> list[tuple[float, float]] | None:
+    """Parse a PSAV file: one 'x y' pair per line, chord fractions, no header.
+
+    Points run upper trailing edge -> leading edge -> lower trailing edge.
+    Any row that is not exactly two finite numbers rejects the file.
+    """
+    if not path.exists():
+        return None
+    points: list[tuple[float, float]] = []
+    for line in path.read_text(errors="replace").splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) != 2:
+            return None
+        try:
+            x, y = float(fields[0]), float(fields[1])
+        except ValueError:
+            return None
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return None
+        points.append((x, y))
+    return points or None
 
 def _match_alphas(requested: list[float], points: list[PolarPoint]) -> dict[float, PolarPoint]:
     """Map each requested alpha to the polar row that reports it, if any.
@@ -622,15 +651,19 @@ def run_polar(
             _collect_fields(wd, requested, matched, "cp", _parse_cp_file)
             if "cp" in outputs else ({}, [])
         )
+        geometry = _parse_coords_file(wd / "geometry.txt") if "geometry" in outputs else None
+
+    _check_geometry_applied(stdout, flap)
 
     failed = [a for a in requested if a not in matched]
     warnings = _scan_stdout(stdout, max_iter)
     warnings += bl_warnings + cp_warnings
-    _check_geometry_applied(stdout, flap)
     if not points:
         warnings.append("no converged points; check warnings above")
     if non_finite:
         warnings.append(f"non-finite values in the polar at alphas {non_finite}; treated as not converged")
+    if "geometry" in outputs and geometry is None:
+        warnings.append("geometry requested but the PSAV file was missing or unreadable")
     march = len(_MRCHDU_FAILURE.findall(stdout))
 
     return PolarResult(
@@ -649,6 +682,7 @@ def run_polar(
         bl=bl,
         cp=cp,
         march_failures=march,
+        geometry=geometry,
     )
 
 

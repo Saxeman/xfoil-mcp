@@ -79,3 +79,12 @@ def test_flap_is_applied_and_repaneled_before_analysis():
     k = lines.index("GDES")
     assert lines[k:k + 5] == ["GDES", "FLAP 0.7 0.0 10.0", "EXEC", "", "PANE"]
     assert lines.index("NACA 2412") < k < lines.index("OPER")
+
+def test_geometry_output_saves_the_outline_before_solving():
+    lines = script(outputs=("forces", "geometry"), flap=(0.7, 0.0, 10.0))
+    k = lines.index("PSAV geometry.txt")
+    assert lines.index("PANE") < k < lines.index("OPER")    # after the flap is final
+
+
+def test_no_geometry_output_means_no_psav():
+    assert not any(l.startswith("PSAV") for l in script())

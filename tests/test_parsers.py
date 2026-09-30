@@ -9,12 +9,16 @@ import pytest
 import shutil
 
 from xfoil_mcp.wrapper import (
-    BoundaryLayer, CpDistribution, PolarPoint, _collect_fields, _parse_bl_file, _parse_cp_file, _drop_non_finite,
+    BoundaryLayer, CpDistribution, PolarPoint, _collect_fields, _parse_bl_file, _parse_cp_file, _drop_non_finite, _parse_coords_file
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
 BL_A4 = FIXTURES / "bl_2412_re1e6_a4.txt"
 CP_A4 = FIXTURES / "cp_2412_re1e6_a4.txt"
+
+COORDS_FLAP = FIXTURES / "naca2412_flap_10.dat"
+
+
 
 
 @pytest.fixture
@@ -158,3 +162,21 @@ def test_polar_rows_with_non_finite_values_are_dropped():
     kept, dropped = _drop_non_finite([good, bad])
     assert kept == [good]
     assert dropped == [1.0]
+
+# --- geometry ----------------------------------------------------------------
+
+def test_coords_file_parses_to_160_points():
+    pts = _parse_coords_file(COORDS_FLAP)
+    assert len(pts) == 160
+    assert pts[0] == pytest.approx((0.9956611, -0.0508536))       # upper trailing edge
+    assert min(x for x, _ in pts) == pytest.approx(0.0, abs=1e-4)  # the nose
+
+
+def test_coords_file_with_a_bad_row_is_rejected(tmp_path):
+    bad = tmp_path / "bad.dat"
+    bad.write_text("1.0 0.001\n0.5\n")
+    assert _parse_coords_file(bad) is None
+
+
+def test_missing_coords_file_returns_none(tmp_path):
+    assert _parse_coords_file(tmp_path / "nope.dat") is None

@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 MAX_ALPHA_POINTS = 200
 
-Output = Literal["forces", "cp", "bl"]
+Output = Literal["forces", "cp", "bl", "geometry"]
 Status = Literal["ok", "partial", "empty", "error"]
 FailureKind = Literal["input", "infrastructure", "numerical"]
 

@@ -17,6 +17,7 @@ markers = [
 control = ["fastmcp"]
 sandbox = ["numpy", "scipy"]
 thermal = ["numpy", "scipy", "scikit-fem"]
+cad = ["cadquery"]
 dev = ["pytest"]
 
 [build-system]
