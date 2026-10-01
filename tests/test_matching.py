@@ -45,9 +45,13 @@ def test_tolerance_cannot_match_one_row_to_two_requests():
     only be claimed by both if the tolerance reaches halfway between them."""
     assert POLAR_ALPHA_RESOLUTION < MIN_ALPHA_STEP / 2
 
-APPLIED = (" Flap hinge: x,y =  0.70000  0.00000\n"
-           " Current airfoil nodes set from buffer airfoil nodes ( 248 )\n")
 FLAP = (0.7, 0.0, 10.0)
+
+def xfoil_says(y_hinge: float) -> str:
+    return (" Top    surface:  y =  0.0516     y/t = 1.0\n"
+            " Bottom surface:  y = -0.0216     y/t = 0.0\n"
+            f" Flap hinge: x,y =  0.70000  {y_hinge:.5f}\n"
+            " Current airfoil nodes set from buffer airfoil nodes ( 248 )\n")
 
 def test_applied_flap_passes():
     _check_geometry_applied(xfoil_says(0.0), flap=(0.7, 0.0, 10.0))
@@ -63,12 +67,6 @@ def test_flap_that_never_reached_xfoil_is_an_error():
 
 def test_no_flap_requested_means_nothing_to_check():
     _check_geometry_applied(MISMATCH, flap=None)
-
-def xfoil_says(y_hinge: float) -> str:
-    return (" Top    surface:  y =  0.0516     y/t = 1.0\n"
-            " Bottom surface:  y = -0.0216     y/t = 0.0\n"
-            f" Flap hinge: x,y =  0.70000  {y_hinge:.5f}\n"
-            " Current airfoil nodes set from buffer airfoil nodes ( 248 )\n")
 
 def test_hinge_outside_the_airfoil_is_an_error():
     with pytest.raises(XfoilError):

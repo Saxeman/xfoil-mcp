@@ -64,6 +64,21 @@ def test_estimates_match_the_real_slice(clean):
     assert clean.stats["estimated_print_minutes"] == pytest.approx(39, abs=2)
 
 
+def test_requested_dimensions_are_the_part_dimensions():
+    part = build_section(outline("naca2412_flap_none.dat"), chord_mm=100.0, span_mm=20.0)
+    assert part.stats["chord_mm"] == pytest.approx(100.0, abs=0.05)
+    assert part.stats["span_mm"] == pytest.approx(20.0, abs=0.01)
+
+
+@pytest.mark.parametrize("size", [
+    {"chord_mm": 0.0}, {"chord_mm": -5.0}, {"chord_mm": 251.0},
+    {"span_mm": 0.5}, {"span_mm": 1000.0}, {"span_mm": float("nan")},
+])
+def test_dimensions_the_printer_cannot_hold_are_an_error(size):
+    with pytest.raises(CadError):
+        build_section(outline("naca2412_flap_none.dat"), **size)
+
+
 def test_too_few_points_is_an_error():
     with pytest.raises(CadError):
         build_section([(0.0, 0.0), (1.0, 0.0)])

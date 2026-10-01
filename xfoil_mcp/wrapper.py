@@ -17,15 +17,6 @@ Failure modes handled here, all observed experimentally:
      and exhausting stdin crashes the process with a Fortran backtrace.
 """
 
-# TODO: ADD THIS IN TO FORCE FORTRAN OVERFLOW INTO /DEV/NULL
-# If using a Python wrapper script:
-# import os
-# try:
-#     os.symlink('/dev/null', '/tmp/:00.bl')
-# except FileExistsError:
-#     pass # Already exists from a previous run
-
-
 from __future__ import annotations
 
 import os
@@ -204,7 +195,9 @@ class PolarResult:
         The full point table is large and mostly uninteresting; this is the
         part a caller usually reasons over.
         """
-        best = max(self.points, key=lambda p: p.ld, default=None)
+        # A zero-drag row has no L/D (ld is NaN), and max() over a NaN key depends
+        # on row order, so those rows are left out.
+        best = max((p for p in self.points if p.cd > 0), key=lambda p: p.ld, default=None)
         peak_cl = max(self.points, key=lambda p: p.cl, default=None)
         return {
             "status": self.status,
@@ -225,7 +218,7 @@ class PolarResult:
         }
 
 def _expected_alphas(start: float, end: float, step: float) -> list[float]:
-    """Reproduce ASEQ's sequence without accumulating float error."""
+    """The sweep's alphas, start to end inclusive, without accumulating float error."""
     if step <= 0:
         raise ValueError("alpha_step must be positive")
     if step < MIN_ALPHA_STEP:
@@ -690,6 +683,3 @@ if __name__ == "__main__":
 
     clean = run_polar("2412", 1e6, 0, 10, 1)
     print(json.dumps(clean.summary(), indent=2))
-
-#    cascade = run_polar("2412", 1e6, 0, 20, 1, max_iter=5)
-#    print(json.dumps(cascade.summary(), indent=2))

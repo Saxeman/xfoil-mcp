@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 from fastmcp import Client
@@ -148,6 +149,7 @@ def test_run_polar_advertises_its_parameters():
             return set(tools["run_polar"].input_schema["properties"])
     assert asyncio.run(_go()) == {
         "airfoil", "reynolds", "alpha_start", "alpha_end", "alpha_step", "n_crit", "max_iter",
+        "flap_deflection_deg", "flap_hinge",
     }
 
 
@@ -273,6 +275,31 @@ def test_run_polar_builds_the_case_the_arguments_describe(monkeypatch):
     assert c.conditions.alpha_end == 12
     assert c.conditions.n_crit == 4
     assert out["content_hash"] == c.content_hash()
+
+
+def test_run_polar_always_asks_for_the_outline(monkeypatch):
+    """Without "geometry" in outputs the result could never be printed."""
+    seen = {}
+    monkeypatch.setattr(harness.dispatch, "run_case",
+                        lambda c, timeout=180.0: seen.setdefault("case", c) and ok_result(c))
+    call("run_polar", airfoil="2412", reynolds=1e6)
+    assert seen["case"].outputs == ("forces", "geometry")
+    assert seen["case"].geometry.flap is None
+
+
+def test_run_polar_flap_arguments_become_the_flap(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(harness.dispatch, "run_case",
+                        lambda c, timeout=180.0: seen.setdefault("case", c) and ok_result(c))
+    call("run_polar", airfoil="2412", reynolds=1e6, flap_deflection_deg=10, flap_hinge=0.75)
+    flap = seen["case"].geometry.flap
+    assert (flap.x_hinge, flap.deflection) == (0.75, 10)
+
+
+def test_run_polar_flap_out_of_range_is_an_input_error(no_dispatch):
+    out = call("run_polar", airfoil="2412", reynolds=1e6, flap_deflection_deg=80)
+    assert out["failure_kind"] == "input"
+    assert any("flap" in e for e in out["errors"])
 
 
 def test_run_polar_goes_through_the_harness(monkeypatch):
@@ -470,8 +497,6 @@ def test_new_campaign_replaces_the_previous_batch(monkeypatch):
 
 
 # -- Misc Tests
-# tests/test_server.py, in the registration section
-from pathlib import Path
 
 @pytest.mark.parametrize("module", ["server", "harness", "sandbox", "dispatch"])
 def test_host_modules_never_print_to_stdout(module):
@@ -587,8 +612,6 @@ def test_partial_thermal_coverage_makes_the_design_partial(monkeypatch):
 # 7. printing
 # ==========================================================================
 
-from pathlib import Path
-
 OUTLINE = [[float(v) for v in line.split()]
            for line in (Path(__file__).parent / "fixtures" / "naca2412_flap_10.dat").read_text().splitlines()
            if line.strip()]
@@ -658,10 +681,41 @@ def test_after_the_person_approves_the_print_is_sent_once(printing, monkeypatch)
     assert again["print_status"] == "sent"
 
 
+def polar_run(monkeypatch) -> str:
+    """Run run_polar against a fake harness whose result carries an outline."""
+    def fake(case, timeout=180.0):
+        result = ok_result(case)
+        return result.model_copy(update={"data": {**result.data, "geometry": OUTLINE}})
+
+    monkeypatch.setattr(server.harness, "evaluate", fake)
+    return call("run_polar", airfoil="2412", reynolds=1e6)["content_hash"]
+
+
+def test_a_polar_run_can_be_printed(printing, monkeypatch):
+    out = call("request_print", content_hash=polar_run(monkeypatch))
+    assert out["status"] == "ok"
+    assert out["print_status"] == "pending"
+    assert out["stats"]["span_mm"] == 40.0
+
+
+def test_print_size_arguments_reach_the_part(printing, monkeypatch):
+    out = call("request_print", content_hash=polar_run(monkeypatch), chord_mm=100, span_mm=20)
+    assert out["status"] == "ok"
+    assert out["stats"]["span_mm"] == 20.0
+    assert out["stats"]["chord_mm"] == pytest.approx(100, abs=1.0)    # the flap shortens the projection
+
+
+def test_print_size_the_printer_cannot_hold_is_an_input_error(printing, monkeypatch):
+    out = call("request_print", content_hash=polar_run(monkeypatch), chord_mm=1000)
+    assert out["failure_kind"] == "input"
+    assert "chord_mm" in out["errors"][0]
+
+
 def test_design_without_geometry_says_how_to_get_it(printing, monkeypatch):
     out = call("request_print", content_hash=evaluated_design(monkeypatch, geometry=None))
     assert out["failure_kind"] == "input"
     assert "geometry" in out["errors"][0]
+    assert "run_polar" in out["errors"][0]
 
 def test_default_outbox_is_at_the_repository_root():
     repo_root = Path(__file__).resolve().parent.parent

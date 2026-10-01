@@ -7,8 +7,11 @@ layer -> stagnation point -> h(s) -> skin temperature.
 import math
 from pathlib import Path
 
-import numpy as np
 import pytest
+
+pytest.importorskip("skfem")     # the thermal extra
+
+import numpy as np
 
 from xfoil_mcp.coupling import Air, heat_transfer, stagnation_point, velocity_for
 from xfoil_mcp.thermal import build_mesh_nodes, skin_temperature

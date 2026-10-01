@@ -14,24 +14,23 @@ import os
 import subprocess
 import time
 import uuid
-import logging
 from dataclasses import dataclass, field
 
 from xfoil_mcp.schema import Case
 
 SANDBOX_IMAGE = os.environ.get("XFOIL_SANDBOX_IMAGE", "xfoil-sandbox")
 
-# Every flag answers a specific attack. See ARCHITECTURE.md for the table.
+# Every flag answers a specific attack.
 SANDBOX_FLAGS = [
-    "--network", "none",
-    "--read-only",
-    "--tmpfs", "/tmp:size=64m",
-    "--memory", "512m",
-    "--cpus", "1",
-    "--pids-limit", "64",
-    "--cap-drop", "ALL",
-    "--security-opt", "no-new-privileges",
-    "--user", "65534:65534",
+    "--network", "none",                    # no exfiltration, no downloads
+    "--read-only",                          # nothing persists between runs
+    "--tmpfs", "/tmp:size=64m",             # scratch space that cannot fill the disk
+    "--memory", "512m",                     # memory exhaustion stays in the container
+    "--cpus", "1",                          # cannot starve the host
+    "--pids-limit", "64",                   # fork bombs
+    "--cap-drop", "ALL",                    # no privileged operations
+    "--security-opt", "no-new-privileges",  # no setuid escalation
+    "--user", "65534:65534",                # nobody, not root
 ]
 
 
@@ -43,9 +42,6 @@ class SandboxOutcome:
     killed: bool = False
     wall_seconds: float = 0.0
 
-    @property
-    def ok(self) -> bool:
-        return not self.killed and not self.errors and not self.rejected
 
 def run_campaign_source(source: str, timeout: float = 30.0) -> SandboxOutcome:
     name = f"xfoil-sandbox-{uuid.uuid4().hex[:12]}"

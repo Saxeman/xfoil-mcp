@@ -22,6 +22,11 @@ GRAMS_PER_CM3 = 55.27 / 148.1
 PRINT_MINUTES_PER_CM3 = 64.0 / 148.1
 PREP_MINUTES = 7.25
 
+# Both dimensions must fit the printer the estimates were calibrated on (256 mm
+# build volume), with a margin. Below 1 mm there is nothing to print.
+MIN_DIMENSION_MM = 1.0
+MAX_DIMENSION_MM = 250.0
+
 
 class CadError(ValueError):
     """The outline cannot become a valid solid."""
@@ -41,7 +46,14 @@ def build_section(
 
     The section lies in the XY plane and the span runs along Z, which is also
     the print orientation: every layer is one slice of the airfoil.
+    chord_mm and span_mm must each lie between MIN_DIMENSION_MM and
+    MAX_DIMENSION_MM.
     """
+    for name, value in (("chord_mm", chord_mm), ("span_mm", span_mm)):
+        if not MIN_DIMENSION_MM <= value <= MAX_DIMENSION_MM:     # also refuses NaN
+            raise CadError(
+                f"{name} must be between {MIN_DIMENSION_MM:g} and {MAX_DIMENSION_MM:g} mm, got {value}"
+            )
     if len(outline) < 3:
         raise CadError(f"an outline needs at least 3 points, got {len(outline)}")
 

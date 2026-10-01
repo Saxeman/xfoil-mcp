@@ -12,10 +12,15 @@ campaign cannot run anything; it can only describe what it would run.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
 
 from xfoil_mcp.schema import Case
+
+# Recorded at import, before any campaign code runs, so main() can tell the
+# original process from children a campaign forked.
+_ORIGINAL_PID = os.getpid()
 
 
 def _run(source: str) -> dict:
@@ -47,9 +52,6 @@ def _run(source: str) -> dict:
         cases.append(item.model_dump(mode="json"))
 
     return {"cases": cases, "errors": errors}
-
-import os
-_ORIGINAL_PID = os.getpid()
 
 
 def main() -> int:

@@ -13,7 +13,7 @@ output of a dry run and changes if the campaign changes.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from xfoil_mcp import dispatch, sandbox
 from xfoil_mcp.schema import Case, CaseResult
@@ -67,10 +67,11 @@ class BatchResult:
 
     @property
     def complete(self) -> bool:
-        """Every case reached a terminal state. Sequential dispatch means this
-        is always true once submit returns; it is here because a queued
-        implementation will need it, and the payload contract includes it."""
-        return all(r.status in ("ok", "partial", "empty", "error") for r in self.results)
+        """Every case reached a terminal state. Always true while dispatch is
+        sequential, because submit returns only after the last case. It stays
+        because the payload contract includes it and a queued implementation
+        will need a real answer here."""
+        return True
 
     @property
     def counts(self) -> dict[str, int]:

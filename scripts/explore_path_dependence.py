@@ -14,9 +14,11 @@ previous converged solution, so results depend on the order points were
 computed in. Two consequences, which are easy to conflate and are worth
 keeping straight:
 
-  Converged VALUES are not path-dependent. The viscous-inviscid coupling
-  solves a system of equations with one solution; warm starting changes the
-  route to that solution, not the solution itself.
+  Converged VALUES did not depend on the path in the range tested here
+  (Re 1e6, alpha 0 to 10): warm starting changed the route to the solution,
+  not the solution. That is not a general guarantee. Near stall and at low
+  Reynolds number, viscous-inviscid solutions can show hysteresis, where
+  the answer itself depends on the direction of approach.
 
   CONVERGENCE ITSELF is path-dependent. Whether a point converges at all,
   and how many iterations it takes, depend on where the solve started.

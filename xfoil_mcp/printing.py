@@ -1,9 +1,10 @@
 """The print queue: when a part may be printed, and who decides.
 
-A request moves pending -> approved -> sent, or pending -> rejected, and an
-approval can expire. Approval names the file by its hash, is used once, and
-the bytes are re-hashed at send time. The web page and the MCP tools both
-call into this; the rules live only here.
+A request moves pending -> approved -> sent, or pending -> rejected. An
+approval can expire, and a request whose file or backend fails at send time
+ends as failed. Approval names the file by its hash, is used once, and the
+bytes are re-hashed at send time. The web page and the MCP tools both call
+into this; the rules live only here.
 
 Backends do the sending. DryBackend writes to an outbox folder; the printer
 backend replaces only that.

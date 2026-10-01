@@ -1,9 +1,9 @@
 """The contract between agent-written campaigns, the harness, and the workers.
 
-This module is installed in every environment (host, worker, sandbox) and is
-the only module present in all three. It knows nothing about XFOIL, Docker,
-or MCP. It defines what a Case is, what a CaseResult is, and refuses to
-construct either when the values are not physically meaningful.
+This module is installed in every environment (host, worker, sandbox,
+thermal) and is the only module present in all four. It knows nothing about
+XFOIL, Docker, or MCP. It defines what a Case is, what a CaseResult is, and
+refuses to construct either when the values are not physically meaningful.
 
 Validation happens at construction. An invalid Case cannot exist, so every
 consumer downstream can trust the values without re-checking them.
@@ -121,7 +121,7 @@ class Conditions(_Strict):
         return math.floor((self.alpha_end - self.alpha_start) / self.alpha_step + 1e-9) + 1
 
     def alphas(self) -> list[float]:
-        """The sequence XFOIL's ASEQ will produce, without float drift.
+        """The sweep the wrapper runs, one ALFA per value, without float drift.
 
         Kept in step with wrapper._expected_alphas, which cannot import this
         module. test_schema asserts they agree.

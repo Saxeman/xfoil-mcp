@@ -12,8 +12,7 @@ COPY pyproject.toml .
 COPY xfoil_mcp/ xfoil_mcp/
 RUN pip install --no-cache-dir -e .
 
-# Worker has no business on the network; the host passes --network none too,
-# but a container that assumes it is offline is easier to reason about.
+# Stamped into every result's provenance by worker.py.
 ENV XFOIL_IMAGE="xfoil-worker"
 
 CMD ["python", "-m", "xfoil_mcp.worker"]

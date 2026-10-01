@@ -37,8 +37,8 @@ def _serialize(result: PolarResult) -> dict:
     belongs in a log store, not a result payload.
 
     Field outputs are keyed by alpha, a float. JSON object keys must be
-    strings, so 4.0 becomes "4.0" here, in one place. The host reads them
-    back with float(key).
+    strings, so 4.0 becomes "4.0" here, in one place. The thermal stage reads
+    them back with float(key).
     """
     d = dataclasses.asdict(result)
     d.pop("stdout", None)
@@ -53,7 +53,6 @@ def run_case(case: Case) -> CaseResult:
     f = case.geometry.flap
     flap = None if f is None else (f.x_hinge, f.y_hinge, f.deflection)
 
-    
     try:
         polar = run_polar(
             airfoil=case.geometry.naca,

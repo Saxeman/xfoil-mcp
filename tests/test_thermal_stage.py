@@ -4,14 +4,11 @@ The aero result is built from the step 1 fixture in the same shape the
 worker returns, so these run on the host without XFOIL.
 """
 
-import dataclasses
-from pathlib import Path
-
 import pytest
 
-from xfoil_mcp.schema import Case, CaseResult, Conditions, Geometry
+pytest.importorskip("skfem")     # the thermal extra
+
 from xfoil_mcp.thermal_stage import evaluate_thermal
-from xfoil_mcp.wrapper import _parse_bl_file
 
 from builders import THERMAL, aero
 

@@ -24,9 +24,9 @@ import shutil
 
 import pytest
 
-from xfoil_mcp.wrapper import run_polar
+from xfoil_mcp.wrapper import XFOIL_BIN, run_polar
 
-pytestmark = pytest.mark.skipif(shutil.which("xfoil") is None,
+pytestmark = pytest.mark.skipif(shutil.which(XFOIL_BIN) is None,
                                 reason="needs xfoil; run inside the worker container")
 
 CLEAN = dict(airfoil="2412", reynolds=1e6, alpha_start=0, alpha_end=10, alpha_step=1)
@@ -169,10 +169,11 @@ def test_bl_from_a_real_run_matches_the_fixture_layout():
 
 
 def test_requesting_fields_does_not_change_forces():
-    """Step 3 claimed ALFA-per-point warm-starts the way ASEQ does. This checks it."""
-    aseq = run_polar("2412", 1e6, 0, 6, 2)
-    alfa = run_polar("2412", 1e6, 0, 6, 2, outputs=("forces", "bl"))
-    for a, b in zip(aseq.points, alfa.points):
+    """Writing a DUMP after each ALFA must not disturb the solution it follows."""
+    plain = run_polar("2412", 1e6, 0, 6, 2)
+    with_bl = run_polar("2412", 1e6, 0, 6, 2, outputs=("forces", "bl"))
+    assert len(plain.points) == len(with_bl.points)
+    for a, b in zip(plain.points, with_bl.points):
         assert a.cl == pytest.approx(b.cl, abs=2e-4)
         assert a.cd == pytest.approx(b.cd, abs=2e-5)
 

@@ -83,7 +83,13 @@ def run_thermal(aero: CaseResult, timeout: float = 120.0) -> dict:
 
 
 def run_case(case: Case, timeout: float = 180.0) -> CaseResult:
-    """..."""
+    """Run one case in a fresh worker container and return its result.
+
+    The container's output is not trusted: a non-zero exit, output that does
+    not parse as a CaseResult, or a result for a different case each come
+    back as an infrastructure failure. A timeout kills the container by
+    name, because killing the docker client alone leaves it running.
+    """
     name = f"xfoil-worker-{uuid.uuid4().hex[:12]}"
     cmd = [
         "docker", "run", "--rm", "-i", "--name", name,

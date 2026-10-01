@@ -10,9 +10,10 @@ import pytest
 
 from xfoil_mcp.schema import Case, CaseResult, Conditions, Flap, Geometry
 from xfoil_mcp.worker import run_case
+from xfoil_mcp.wrapper import XFOIL_BIN
 
 pytestmark = pytest.mark.skipif(
-    shutil.which("xfoil") is None,
+    shutil.which(XFOIL_BIN) is None,
     reason="needs xfoil; run inside the worker container",
 )
 

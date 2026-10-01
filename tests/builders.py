@@ -1,10 +1,7 @@
 import dataclasses
 from pathlib import Path
 
-import pytest
-
 from xfoil_mcp.schema import Case, CaseResult, Conditions, Geometry
-from xfoil_mcp.thermal_stage import evaluate_thermal
 from xfoil_mcp.wrapper import _parse_bl_file
 
 BL_A4 = Path(__file__).parent / "fixtures" / "bl_2412_re1e6_a4.txt"

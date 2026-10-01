@@ -9,10 +9,11 @@ not a limit you understand.
 
 from __future__ import annotations
 
+import json
+import subprocess
 from pathlib import Path
 
 import pytest
-import subprocess
 
 from xfoil_mcp import sandbox
 
@@ -30,14 +31,14 @@ def run(name: str, timeout: float = 30.0) -> sandbox.SandboxOutcome:
 
 def test_benign_campaign_returns_cases():
     outcome = sandbox.run_campaign_source((CAMPAIGNS / "single_polar.py").read_text())
-    assert outcome.ok, (outcome.errors, outcome.rejected)
+    assert not (outcome.killed or outcome.errors or outcome.rejected), (outcome.errors, outcome.rejected)
     assert len(outcome.cases) == 1
     assert outcome.cases[0].geometry.naca == "2412"
 
 
 def test_lhs_campaign_uses_scipy_inside_sandbox():
     outcome = sandbox.run_campaign_source((CAMPAIGNS / "lhs_naca4.py").read_text())
-    assert outcome.ok, (outcome.errors, outcome.rejected)
+    assert not (outcome.killed or outcome.errors or outcome.rejected), (outcome.errors, outcome.rejected)
     assert len(outcome.cases) == 12
     assert all(len(c.geometry.naca) == 4 for c in outcome.cases)
 
@@ -106,9 +107,6 @@ def test_malformed_cases_from_sandbox_are_rejected_on_host(monkeypatch):
     """If the sandbox somehow emits an out-of-bounds case, the host rejects
     it rather than running it. Simulated by feeding run_campaign_source a
     fake docker result."""
-    import json
-    import subprocess
-
     fake_payload = json.dumps({
         "cases": [
             {"geometry": {"naca": "2412"},

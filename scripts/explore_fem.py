@@ -43,9 +43,9 @@ def solve_strip(x):
 
 print(f"spreading distance {lam * 1000:.1f} mm; exact centre rise {exact(0.0):.3f} K\n")
 for n in (201, 401, 801, 1601):
-    # Make sure the heater's edges are nodes, so the band starts and stops cleanly
+    # Each of these n puts a node on the heater's edges (x = +/-a), so the band
+    # starts and stops cleanly. Other values of n would not.
     x = np.linspace(-L, L, n)
-    print(np.diff(x).min())
     theta = solve_strip(x)
     centre = theta[np.argmin(np.abs(x))]
     error = np.max(np.abs(theta - exact(x)))

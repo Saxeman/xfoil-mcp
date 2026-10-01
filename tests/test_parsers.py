@@ -9,7 +9,7 @@ import pytest
 import shutil
 
 from xfoil_mcp.wrapper import (
-    BoundaryLayer, CpDistribution, PolarPoint, _collect_fields, _parse_bl_file, _parse_cp_file, _drop_non_finite, _parse_coords_file
+    BoundaryLayer, CpDistribution, PolarPoint, PolarResult, _collect_fields, _parse_bl_file, _parse_cp_file, _drop_non_finite, _parse_coords_file
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -162,6 +162,17 @@ def test_polar_rows_with_non_finite_values_are_dropped():
     kept, dropped = _drop_non_finite([good, bad])
     assert kept == [good]
     assert dropped == [1.0]
+
+
+@pytest.mark.parametrize("zero_drag_first", [True, False])
+def test_best_ld_ignores_a_zero_drag_row_wherever_it_sits(zero_drag_first):
+    """L/D is undefined at zero drag, and max() over a NaN key depends on order."""
+    real = PolarPoint(alpha=1.0, cl=0.9, cd=0.01, cdp=0.005, cm=-0.05, top_xtr=0.6, bot_xtr=1.0)
+    zero = PolarPoint(alpha=0.0, cl=0.24, cd=0.0, cdp=0.0, cm=-0.05, top_xtr=0.65, bot_xtr=1.0)
+    points = [zero, real] if zero_drag_first else [real, zero]
+    summary = PolarResult(airfoil="2412", reynolds=1e6, mach=0.0, n_crit=9.0, max_iter=100,
+                          requested_alphas=[0.0, 1.0], points=points).summary()
+    assert (summary["best_ld"], summary["best_ld_alpha"]) == (90.0, 1.0)
 
 # --- geometry ----------------------------------------------------------------
 

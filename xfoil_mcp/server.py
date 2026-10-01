@@ -55,7 +55,7 @@ _ARGUMENT_NAMES = {
 _AERO_HIDDEN = {"thermal", "airfoil", "reynolds", "field_outputs"}
 _THERMAL_SHOWN = ("status", "failure_kind", "errors", "coverage", "worst_case", "excluded")
 
-_designs: dict = {}          # evaluate_design results this session, by content hash
+_designs: dict = {}          # run_polar and evaluate_design results this session, by content hash
 _print_queue = None          # created on the first print request
 _print_site = None
 _print_base_url = None
@@ -145,7 +145,7 @@ def _design_response(case, result) -> dict:
 # --- printing ----------------------------------------------------------------
 
 def _default_outbox():
-    """xfoil_outbox/ at the repository root, found from this file's location.
+    """outbox/ at the repository root, found from this file's location.
 
     Not the working directory: Claude Desktop starts the server from one we
     don't control. This file is <repo>/xfoil_mcp/server.py, so the repo root
@@ -180,12 +180,7 @@ def _find_design(content_hash: str):
     """A design evaluated this session, or a case from the most recent campaign."""
     if content_hash in _designs:
         return _designs[content_hash]
-    if _last_batch is not None:
-        try:
-            return _last_batch.get(content_hash)
-        except KeyError:
-            return None
-    return None
+    return _last_batch.get(content_hash) if _last_batch is not None else None
 
 # --- tools -----------------------------------------------------------------
 
@@ -198,6 +193,8 @@ def run_polar(
     alpha_step: float = 1.0,
     n_crit: float = 9.0,
     max_iter: int = 100,
+    flap_deflection_deg: float | None = None,
+    flap_hinge: float = 0.7,
 ) -> dict:
     """Run one viscous angle-of-attack sweep on a NACA airfoil with XFOIL.
 
@@ -218,6 +215,9 @@ def run_polar(
         not a measurement.
     max_iter: viscous iteration limit. Raise toward 200 only for points that
         fail to converge near stall.
+    flap_deflection_deg: omit for no flap; positive is trailing edge down,
+        which adds lift. flap_hinge is the hinge position as a fraction of
+        chord (0.5 to 0.9).
 
     Returns status, converged vs requested points, which alphas failed and
     whether the failures are consecutive, best L/D and where, and max CL
@@ -227,19 +227,29 @@ def run_polar(
     the failed region, or accept the gap. Consecutive failures near the top
     of the sweep usually mean stall. A failure_kind of "input" means the
     arguments were invalid; fix them rather than retrying.
+
+    The outline XFOIL analysed is kept with the result, so this airfoil can
+    be printed: pass the returned content_hash to request_print.
     """
     try:
         case = Case.model_validate({
-            "geometry": {"naca": airfoil},
+            "geometry": {
+                "naca": airfoil,
+                "flap": None if flap_deflection_deg is None
+                        else {"x_hinge": flap_hinge, "deflection": flap_deflection_deg},
+            },
             "conditions": {
                 "reynolds": reynolds, "alpha_start": alpha_start, "alpha_end": alpha_end,
                 "alpha_step": alpha_step, "n_crit": n_crit, "max_iter": max_iter,
             },
+            # The outline costs one XFOIL command and makes the result printable.
+            "outputs": ["forces", "geometry"],
         })
     except ValidationError as exc:
         return _error("input", _validation_errors(exc), content_hash=None)
 
     result = harness.evaluate(case)
+    _designs[case.content_hash()] = result
     if result.status == "error":
         return _error(
             result.failure_kind,
@@ -287,10 +297,12 @@ def evaluate_design(
     air_temperature_c: freestream air temperature in Celsius, e.g. -10.
     heater_power_w_per_m: total heater power per metre of span.
     heater_width: heater band width as a fraction of chord (0.1 = 10%).
-    skin_thickness_mm, skin_conductivity_w_mk: about 200 for aluminium,
-        about 1 for carbon composite. Aluminium spreads heat far beyond the
-        band; composite keeps it near the band and runs much hotter.
+    skin_thickness_mm: skin thickness in millimetres (default 1).
+    skin_conductivity_w_mk: about 200 for aluminium, about 1 for carbon
+        composite. Aluminium spreads heat far beyond the band; composite
+        keeps it near the band and runs much hotter.
     flap_deflection_deg: omit for no flap; positive is trailing edge down.
+    flap_hinge: hinge position as a fraction of chord, 0.5 to 0.9 (default 0.7).
     alpha_start, alpha_end, alpha_step: the sweep, in degrees.
 
     Returns a stage-by-stage trace (aero, then thermal) and a per-alpha table
@@ -336,13 +348,18 @@ def evaluate_design(
 
 
 @mcp.tool
-def request_print(content_hash: str) -> dict:
+def request_print(content_hash: str, chord_mm: float = 150.0, span_mm: float = 40.0) -> dict:
     """Prepare a printed section of a design and ask the user to approve it.
 
-    content_hash comes from evaluate_design (or from a campaign whose cases
-    included "geometry" in outputs). Builds the part from the exact outline
-    XFOIL analysed, then opens a review page on the user's machine showing
-    the part in 3D, its stats, and the file's hash.
+    content_hash comes from run_polar or evaluate_design (or from a campaign
+    whose cases included "geometry" in outputs). To print an airfoil that
+    has not been analysed yet, call run_polar first. Builds the part from
+    the exact outline XFOIL analysed, then serves a review page on the
+    user's machine showing the part in 3D, its stats, and the file's hash.
+
+    chord_mm: printed chord length in millimetres (default 150).
+    span_mm: printed span, the extrusion height, in millimetres (default 40).
+        Each must be between 1 and 250 mm to fit the printer.
 
     This does NOT print anything. Give the user the url and ask them to
     review and approve the part there. Only the user can approve, on that
@@ -354,12 +371,12 @@ def request_print(content_hash: str) -> dict:
         return _error("input", [f"no evaluated design {content_hash!r} in this session"])
     geometry = (result.data or {}).get("geometry")
     if not geometry:
-        return _error("input", ["this design has no geometry; evaluate it with evaluate_design, "
-                                "or include \"geometry\" in the campaign's outputs"])
+        return _error("input", ["this design has no geometry; run it with run_polar or "
+                                "evaluate_design, or include \"geometry\" in the campaign's outputs"])
 
     from xfoil_mcp.cad import CadError, build_section
     try:
-        part = build_section([tuple(p) for p in geometry])
+        part = build_section([tuple(p) for p in geometry], chord_mm=chord_mm, span_mm=span_mm)
     except CadError as exc:
         return _error("input", [str(exc)])
 
@@ -382,12 +399,15 @@ def request_print(content_hash: str) -> dict:
 
 @mcp.tool
 def start_print(request_id: str) -> dict:
-    """Send an approved print request to the printer.
+    """Send an approved print request to the print backend.
 
     Refuses unless the user has approved this request on its review page,
     for the exact file shown there. If it is still awaiting approval, ask
     the user to approve it at the url from request_print, then try again.
     An approval is used once and expires after 30 minutes.
+
+    The backend is currently a dry run: it writes the approved STL and a
+    record of the approval to the outbox folder and returns the file's path.
     """
     from xfoil_mcp.printing import PrintRefused
 
@@ -416,8 +436,8 @@ def dry_run_campaign(source: str) -> dict:
     Each Case can set outputs: "forces" (default), "bl", "cp", "geometry".
     Add "geometry" to any case you might want to print (request_print needs
     it). A Case with a thermal=Thermal(...) block runs the heater analysis
-    after XFOIL and requires "bl" in outputs. Thermal cases cost roughly five
-    times more than aero-only; screen with aero first, add thermal to a
+    after XFOIL and requires "bl" in outputs. Thermal cases cost two to three
+    times as much as aero-only; screen with aero first, add thermal to a
     shortlist.
 
     Example:
