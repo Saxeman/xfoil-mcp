@@ -639,7 +639,6 @@ def run_polar(
         runtime = time.monotonic() - started
         stdout = proc.stdout or ""
         points = _parse_polar_file(polar_path)
-        points = _parse_polar_file(polar_path)
         points, non_finite = _drop_non_finite(points)
         matched = _match_alphas(requested, points)
         wd = Path(workdir)

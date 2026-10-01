@@ -80,8 +80,6 @@ def run_thermal(aero: CaseResult, timeout: float = 120.0) -> dict:
         return out
     finally:
         rm = subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True, timeout=15)
-        if rm.returncode != 0 and "No such container" not in rm.stderr:
-            logging.getLogger(__name__).warning("failed to remove %s: %s", name, rm.stderr.strip())
 
 
 def run_case(case: Case, timeout: float = 180.0) -> CaseResult:
