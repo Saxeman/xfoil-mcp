@@ -112,7 +112,7 @@ def reset_batch():
 @pytest.fixture
 def no_dispatch(monkeypatch):
     """Fail the test if anything reaches dispatch."""
-    monkeypatch.setattr(server.dispatch, "run_case",
+    monkeypatch.setattr(harness.dispatch, "run_case",
                         lambda c, timeout=180.0: pytest.fail("dispatch was called"))
 
 
@@ -160,7 +160,7 @@ def _every_response(monkeypatch) -> list[tuple[str, dict]]:
     case = make_case()
     out: list[tuple[str, dict]] = []
 
-    monkeypatch.setattr(server.dispatch, "run_case", lambda c, timeout=180.0: ok_result(c))
+    monkeypatch.setattr(harness.dispatch, "run_case", lambda c, timeout=180.0: ok_result(c))
     out.append(("run_polar ok", call("run_polar", airfoil="2412", reynolds=1e6)))
     out.append(("run_polar error", call("run_polar", airfoil="24a2", reynolds=1e6)))
 
@@ -264,7 +264,7 @@ def test_run_polar_builds_the_case_the_arguments_describe(monkeypatch):
     def capture(case, timeout=180.0):
         seen["case"] = case
         return ok_result(case)
-    monkeypatch.setattr(server.dispatch, "run_case", capture)
+    monkeypatch.setattr(harness.dispatch, "run_case", capture)
 
     out = call("run_polar", airfoil="4412", reynolds=5e5, alpha_end=12, n_crit=4)
     c = seen["case"]
@@ -275,8 +275,26 @@ def test_run_polar_builds_the_case_the_arguments_describe(monkeypatch):
     assert out["content_hash"] == c.content_hash()
 
 
+def test_run_polar_goes_through_the_harness(monkeypatch):
+    """Every tool reaches the worker by way of the harness, so stage logic
+    added there applies to run_polar too."""
+    seen = []
+
+    def fake(case, timeout=180.0):
+        seen.append(case)
+        return ok_result(case)
+    monkeypatch.setattr(server.harness, "evaluate", fake)
+    monkeypatch.setattr(harness.dispatch, "run_case",
+                        lambda c, timeout=180.0: pytest.fail("run_polar bypassed the harness"))
+
+    out = call("run_polar", airfoil="2412", reynolds=1e6)
+    assert out["status"] == "ok"
+    assert [c.geometry.naca for c in seen] == ["2412"]
+    assert seen[0].thermal is None
+
+
 def test_run_polar_summary_reaches_the_model_without_data(monkeypatch):
-    monkeypatch.setattr(server.dispatch, "run_case", lambda c, timeout=180.0: ok_result(c))
+    monkeypatch.setattr(harness.dispatch, "run_case", lambda c, timeout=180.0: ok_result(c))
     out = call("run_polar", airfoil="2412", reynolds=1e6)
     assert out["status"] == "ok"
     assert out["best_ld"] == 104.4
@@ -285,7 +303,7 @@ def test_run_polar_summary_reaches_the_model_without_data(monkeypatch):
 
 
 def test_run_polar_partial_result_passes_through_with_failed_alphas(monkeypatch):
-    monkeypatch.setattr(server.dispatch, "run_case", lambda c, timeout=180.0: partial_result(c))
+    monkeypatch.setattr(harness.dispatch, "run_case", lambda c, timeout=180.0: partial_result(c))
     out = call("run_polar", airfoil="2412", reynolds=1e6)
     assert out["status"] == "partial"
     assert out["failure_kind"] == "numerical"
@@ -295,7 +313,7 @@ def test_run_polar_partial_result_passes_through_with_failed_alphas(monkeypatch)
 
 
 def test_run_polar_infrastructure_failure_is_retryable(monkeypatch):
-    monkeypatch.setattr(server.dispatch, "run_case", lambda c, timeout=180.0: infra_result(c))
+    monkeypatch.setattr(harness.dispatch, "run_case", lambda c, timeout=180.0: infra_result(c))
     out = call("run_polar", airfoil="2412", reynolds=1e6)
     assert out["status"] == "error"
     assert out["failure_kind"] == "infrastructure"

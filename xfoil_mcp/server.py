@@ -23,7 +23,7 @@ import sys
 from fastmcp import FastMCP
 from pydantic import ValidationError
 
-from xfoil_mcp import dispatch, harness
+from xfoil_mcp import harness
 from xfoil_mcp.schema import Case, FailureKind
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
@@ -239,7 +239,7 @@ def run_polar(
     except ValidationError as exc:
         return _error("input", _validation_errors(exc), content_hash=None)
 
-    result = dispatch.run_case(case)
+    result = harness.evaluate(case)
     if result.status == "error":
         return _error(
             result.failure_kind,
