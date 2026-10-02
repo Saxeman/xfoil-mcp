@@ -60,3 +60,23 @@ def test_hinge_outside_the_airfoil_is_an_input_failure():
 def test_geometry_reaches_the_result():
     result = run_case(case(outputs=("forces", "geometry"), flap=Flap(x_hinge=0.7, deflection=10)))
     assert len(result.data["geometry"]) == 160
+
+
+@pytest.mark.parametrize("naca", ["6412", "4406", "23012"])
+def test_a_flap_with_no_hinge_height_works_on_cambered_sections(naca):
+    """On these sections the chord line is outside the airfoil aft of
+    mid-chord, so a hinge at y = 0 was refused as invalid geometry. Left out,
+    the hinge goes on the camber line, which XFOIL accepts."""
+    flapped = Case(geometry=Geometry(naca=naca, flap=Flap(x_hinge=0.7, deflection=10)),
+                   conditions=Conditions(reynolds=1e6, alpha_start=0, alpha_end=2, alpha_step=2))
+    clean = Case(geometry=Geometry(naca=naca), conditions=flapped.conditions)
+    result, baseline = run_case(flapped), run_case(clean)
+    assert result.status != "error", result.summary
+    assert result.data["points"][0]["cl"] > baseline.data["points"][0]["cl"] + 0.3     # the flap really applied
+
+
+def test_a_hinge_forced_onto_the_chord_line_of_a_cambered_section_is_still_refused():
+    """Giving y_hinge explicitly is honoured, and the wrapper's guard still catches it."""
+    result = run_case(Case(geometry=Geometry(naca="6412", flap=Flap(x_hinge=0.7, y_hinge=0.0, deflection=10)),
+                           conditions=Conditions(reynolds=1e6, alpha_start=0, alpha_end=0, alpha_step=1)))
+    assert (result.status, result.failure_kind) == ("error", "input")

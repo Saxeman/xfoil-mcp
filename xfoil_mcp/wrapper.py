@@ -285,6 +285,8 @@ def _build_commands(
     lines += [
         "OPER",
         f"ITER {max_iter}",
+        "ITER",          # ask for the limit back: `ITER n` sets it without a word
+        "",              # keep it; XFOIL prints "Current iteration limit" before this prompt
         "VPAR",          # viscous parameters
         f"N {n_crit}",
         "",              # leave VPAR
@@ -363,8 +365,13 @@ def _drop_non_finite(points: list[PolarPoint]) -> tuple[list[PolarPoint], list[f
     without complaint. A row with a non-finite value is not a converged
     point, whatever the polar file says.
     """
-    kept = [p for p in points if all(math.isfinite(v) for v in vars(p).values())]
-    dropped = [p.alpha for p in points if p not in kept]
+    kept: list[PolarPoint] = []
+    dropped: list[float] = []
+    for point in points:
+        if all(math.isfinite(v) for v in vars(point).values()):
+            kept.append(point)
+        else:
+            dropped.append(point.alpha)
     return kept, dropped
 
 
@@ -507,8 +514,9 @@ def _collect_fields(
             fields[alpha] = parsed
     return fields, warnings
 
-def _scan_stdout(stdout: str, requested_max_iter: int) -> list[str]:
-    """Pull failure evidence out of stdout.
+def _scan_stdout(stdout: str, requested_max_iter: int) -> tuple[list[str], int]:
+    """Pull failure evidence out of stdout: the warnings, and the number of
+    boundary-layer march failures.
 
     The polar file records only successes. Everything about what went wrong
     lives here and nowhere else.
@@ -524,17 +532,20 @@ def _scan_stdout(stdout: str, requested_max_iter: int) -> list[str]:
     if viscal:
         warnings.append(f"{viscal} point(s) reported VISCAL convergence failure")
 
-    mrchdu = len(_MRCHDU_FAILURE.findall(stdout))
-    if mrchdu:
+    march_failures = len(_MRCHDU_FAILURE.findall(stdout))
+    if march_failures:
         warnings.append(
-            f"{mrchdu} boundary-layer march failure(s) during solves "
+            f"{march_failures} boundary-layer march failure(s) during solves "
             "(some points may have converged from a poor path)"
         )
 
     # Verify the iteration limit was actually applied rather than assuming
-    # the command landed. XFOIL echoes the value when it changes.
+    # the command landed. The script asks for it back with a bare ITER, so
+    # an echo is expected: its absence is evidence too.
     echoes = _ITER_LIMIT_ECHO.findall(stdout)
-    if echoes and int(echoes[-1]) != requested_max_iter:
+    if not echoes:
+        warnings.append("XFOIL never echoed the iteration limit; the input sequence may have desynchronized")
+    elif int(echoes[-1]) != requested_max_iter:
         warnings.append(
             f"iteration limit reads {echoes[-1]}, requested {requested_max_iter}"
         )
@@ -542,10 +553,21 @@ def _scan_stdout(stdout: str, requested_max_iter: int) -> list[str]:
     if "not recognized" in stdout:
         warnings.append("XFOIL rejected a command; the input sequence may have desynchronized")
 
-    if "Fortran runtime error" in stdout:
-        warnings.append("XFOIL crashed with a Fortran runtime error")
+    return warnings, march_failures
 
-    return warnings
+
+def _crash_warning(returncode: int, stderr: str) -> str | None:
+    """Evidence that XFOIL died instead of finishing.
+
+    The Fortran runtime writes its errors to stderr, not stdout, and exits
+    non-zero. The rows already in the polar survive a crash, so without this
+    the alphas after it would read as failures to converge. They were never
+    attempted, which calls for a different response.
+    """
+    if returncode == 0 and "Fortran runtime error" not in stderr:
+        return None
+    return (f"XFOIL crashed (exit status {returncode}); alphas after the last solved point were "
+            f"never attempted. stderr ended: {stderr.strip()[-300:]!r}")
 
 def _check_geometry_applied(stdout: str, flap: tuple[float, float, float] | None) -> None:
     """Require positive evidence that a requested flap reached the analysis.
@@ -630,7 +652,7 @@ def run_polar(
             ) from exc
 
         runtime = time.monotonic() - started
-        stdout = proc.stdout or ""
+        stdout, stderr = proc.stdout or "", proc.stderr or ""
         points = _parse_polar_file(polar_path)
         points, non_finite = _drop_non_finite(points)
         matched = _match_alphas(requested, points)
@@ -648,7 +670,10 @@ def run_polar(
     _check_geometry_applied(stdout, flap)
 
     failed = [a for a in requested if a not in matched]
-    warnings = _scan_stdout(stdout, max_iter)
+    warnings, march_failures = _scan_stdout(stdout, max_iter)
+    crash = _crash_warning(proc.returncode, stderr)
+    if crash:
+        warnings.append(crash)
     warnings += bl_warnings + cp_warnings
     if not points:
         warnings.append("no converged points; check warnings above")
@@ -656,7 +681,6 @@ def run_polar(
         warnings.append(f"non-finite values in the polar at alphas {non_finite}; treated as not converged")
     if "geometry" in outputs and geometry is None:
         warnings.append("geometry requested but the PSAV file was missing or unreadable")
-    march = len(_MRCHDU_FAILURE.findall(stdout))
 
     return PolarResult(
         airfoil=airfoil,
@@ -673,7 +697,7 @@ def run_polar(
         stdout=stdout,
         bl=bl,
         cp=cp,
-        march_failures=march,
+        march_failures=march_failures,
         geometry=geometry,
     )
 

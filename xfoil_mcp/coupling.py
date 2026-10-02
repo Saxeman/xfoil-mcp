@@ -131,15 +131,32 @@ def smith_spalding(distances: list[float], speeds: list[float], air: Air) -> lis
     h = 2k / thickness. Accounts for acceleration, so it holds at the
     stagnation point, where the Reynolds analogy does not. Reproduces the
     flat-plate and cylinder-stagnation results to about 1%.
+
+    A node where the air is at rest gets the limit of the same formula. Near
+    a stagnation point u = a d, so thickness^2 tends to 46.72 nu / (2.87 a):
+    finite, where the formula itself reads 0 / 0. XFOIL prints Ue to five
+    decimals, so a node at the stagnation point reads exactly zero.
     """
     h: list[float] = []
     integral, d_prev, u_prev = 0.0, 0.0, 0.0
-    for d, u in zip(distances, speeds):
+    for k, (d, u) in enumerate(zip(distances, speeds)):
         integral += _power_integral(u_prev, u, d - d_prev)
-        thickness = math.sqrt(46.72 * air.nu * integral / u**2.87)
+        if u > 0.0:
+            thickness = math.sqrt(46.72 * air.nu * integral / u**2.87)
+        else:
+            thickness = math.sqrt(46.72 * air.nu / (2.87 * _velocity_gradient(distances, speeds, k)))
         h.append(2 * air.k / thickness)
         d_prev, u_prev = d, u
     return h
+
+
+def _velocity_gradient(distances: list[float], speeds: list[float], k: int) -> float:
+    """du/dd at node k, where the air is at rest: the slope to the nearest
+    node where it moves, looking downstream first and then upstream."""
+    for j in (*range(k + 1, len(speeds)), *range(k - 1, -1, -1)):
+        if speeds[j] > 0.0 and distances[j] != distances[k]:
+            return speeds[j] / abs(distances[j] - distances[k])
+    raise ValueError("the edge velocity is zero at every node on this side of the stagnation point")
 
 
 def reynolds_analogy(cf: float, ue_ratio: float, velocity: float, air: Air) -> float:
@@ -154,6 +171,8 @@ def reynolds_analogy(cf: float, ue_ratio: float, velocity: float, air: Air) -> f
     """
     wall_shear = abs(cf) * 0.5 * air.rho * velocity**2
     edge_speed = abs(ue_ratio) * velocity
+    if edge_speed == 0.0:
+        return 0.0          # nothing to base the analogy on; the caller's laminar floor applies
     return air.cp * wall_shear * air.pr ** (-2 / 3) / edge_speed
 
 

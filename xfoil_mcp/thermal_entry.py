@@ -9,19 +9,11 @@ Only the result goes to stdout; the host parses that stream.
 
 from __future__ import annotations
 
-import json
 import sys
 import traceback
 
-from xfoil_mcp.schema import CaseResult
-from xfoil_mcp.thermal_stage import evaluate_thermal
-
-
-def _error(kind: str, message: str) -> dict:
-    return {
-        "status": "error", "failure_kind": kind, "errors": [message],
-        "coverage": 0.0, "worst_case": None, "points": [], "excluded": [],
-    }
+from xfoil_mcp.schema import CaseResult, ThermalResult
+from xfoil_mcp.thermal_stage import NoThermalBlock, evaluate_thermal
 
 
 def main() -> int:
@@ -29,16 +21,17 @@ def main() -> int:
     try:
         aero = CaseResult.model_validate_json(raw)
     except Exception as exc:
-        out = _error("input", f"input was not an aero CaseResult: {exc}")
+        out = ThermalResult.failure("input", f"input was not an aero CaseResult: {exc}")
     else:
         try:
             out = evaluate_thermal(aero)
-            out["content_hash"] = aero.case.content_hash()
-        except ValueError as exc:             # e.g. a case with no thermal block
-            out = _error("input", str(exc))
-        except Exception:                      # anything unexpected: a bug, not a bad request
-            out = _error("infrastructure", traceback.format_exc())
-    sys.stdout.write(json.dumps(out))
+        except NoThermalBlock as exc:                  # the request was wrong
+            out = ThermalResult.failure("input", str(exc))
+        except (ArithmeticError, ValueError):          # the numbers were: the same input fails the same way
+            out = ThermalResult.failure("numerical", traceback.format_exc())
+        except Exception:                              # anything else is a bug, not a bad request
+            out = ThermalResult.failure("infrastructure", traceback.format_exc())
+    sys.stdout.write(out.model_dump_json())
     sys.stdout.flush()
     return 0
 

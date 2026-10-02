@@ -11,11 +11,10 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import time
-import uuid
 from dataclasses import dataclass, field
 
+from xfoil_mcp import containers
 from xfoil_mcp.schema import Case
 
 SANDBOX_IMAGE = os.environ.get("XFOIL_SANDBOX_IMAGE", "xfoil-sandbox")
@@ -34,68 +33,74 @@ SANDBOX_FLAGS = [
 ]
 
 
+# Exit codes docker itself uses when it could not start the container or its
+# command. The campaign never ran, so they are not the campaign's fault.
+DOCKER_COULD_NOT_START = {125, 126, 127}
+OUT_OF_MEMORY = 137         # 128 + SIGKILL: what the kernel does at the --memory limit
+
+
 @dataclass
 class SandboxOutcome:
     cases: list[Case] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)   # host-side validation failures
     errors: list[str] = field(default_factory=list)     # from the campaign or the container
-    killed: bool = False
+    killed: bool = False            # the time limit was hit: the campaign is probably looping
+    infrastructure: bool = False    # docker could not run the sandbox: the campaign is not at fault
     wall_seconds: float = 0.0
 
 
+def _exit_error(returncode: int, stderr: str) -> str:
+    """Say what a non-zero exit most likely means, because the three causes
+    call for three different responses."""
+    detail = stderr.strip()[-500:]
+    if returncode in DOCKER_COULD_NOT_START:
+        return f"docker could not start the sandbox (exit {returncode}): {detail}"
+    if returncode == OUT_OF_MEMORY:
+        limit = SANDBOX_FLAGS[SANDBOX_FLAGS.index("--memory") + 1]
+        return f"sandbox exited {returncode}: killed, most likely for exceeding the {limit} memory limit. {detail}".rstrip()
+    return f"sandbox exited {returncode}: the campaign ended the process, or the interpreter crashed. {detail}".rstrip()
+
+
 def run_campaign_source(source: str, timeout: float = 30.0) -> SandboxOutcome:
-    name = f"xfoil-sandbox-{uuid.uuid4().hex[:12]}"
-    cmd = ["docker", "run", "--rm", "-i", "--name", name, *SANDBOX_FLAGS, SANDBOX_IMAGE]
     started = time.monotonic()
+    run = containers.run(SANDBOX_IMAGE, source, timeout, name="xfoil-sandbox", flags=SANDBOX_FLAGS)
+    wall = time.monotonic() - started
+
+    if run.proc is None:
+        return SandboxOutcome(killed=run.timed_out, infrastructure=not run.timed_out,
+                              errors=[run.reason("campaign")], wall_seconds=wall)
+    proc = run.proc
+
+    if proc.returncode != 0:
+        return SandboxOutcome(
+            infrastructure=proc.returncode in DOCKER_COULD_NOT_START,
+            errors=[_exit_error(proc.returncode, proc.stderr)],
+            wall_seconds=wall,
+        )
 
     try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return SandboxOutcome(
+            errors=[f"sandbox output was not JSON: {proc.stdout[:200]!r}"],
+            wall_seconds=wall,
+        )
+
+    # The payload was written by a process that ran campaign code, so its own
+    # shape is checked before anything in it is used.
+    cases, errors = (payload.get(k, []) for k in ("cases", "errors")) if isinstance(payload, dict) else (None, None)
+    if not isinstance(cases, list) or not isinstance(errors, list):
+        return SandboxOutcome(
+            errors=[f"sandbox output did not have the expected shape: {proc.stdout[:200]!r}"],
+            wall_seconds=wall,
+        )
+
+    outcome = SandboxOutcome(errors=[str(e) for e in errors], wall_seconds=wall)
+
+    for i, raw in enumerate(cases):
         try:
-            proc = subprocess.run(
-                cmd, input=source, capture_output=True, text=True, timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            return SandboxOutcome(
-                killed=True,
-                errors=[f"campaign exceeded {timeout}s and was killed"],
-                wall_seconds=time.monotonic() - started,
-            )
-        except FileNotFoundError:
-            return SandboxOutcome(errors=["docker not found on host"])
+            outcome.cases.append(Case.model_validate(raw))
+        except Exception as exc:
+            outcome.rejected.append(f"case {i}: {exc}")
 
-        wall = time.monotonic() - started
-
-        if proc.returncode != 0:
-            return SandboxOutcome(
-                killed=True,
-                errors=[f"sandbox exited {proc.returncode}: {proc.stderr.strip()[-500:]}"],
-                wall_seconds=wall,
-            )
-
-        try:
-            payload = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            return SandboxOutcome(
-                errors=[f"sandbox output was not JSON: {proc.stdout[:200]!r}"],
-                wall_seconds=wall,
-            )
-
-        outcome = SandboxOutcome(errors=list(payload.get("errors", [])), wall_seconds=wall)
-
-        for i, raw in enumerate(payload.get("cases", [])):
-            try:
-                outcome.cases.append(Case.model_validate(raw))
-            except Exception as exc:
-                outcome.rejected.append(f"case {i}: {exc}")
-
-        return outcome
-
-    finally:
-        # Every path out of this function ends here, including the early
-        # returns above. --rm handles a clean exit; this handles the rest.
-        # Best effort: a failed cleanup must not replace the outcome above,
-        # including when docker itself is missing or hangs.
-        try:
-            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=15)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
+    return outcome

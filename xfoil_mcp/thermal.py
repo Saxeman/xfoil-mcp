@@ -14,7 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from skfem import Basis, BilinearForm, ElementLineP1, Functional, LinearForm, MeshLine, solve
+from scipy.sparse import diags
+from skfem import Basis, BilinearForm, ElementLineP1, LinearForm, MeshLine, solve
 from skfem.helpers import dot, grad
 
 FREEZING_K = 273.15
@@ -98,19 +99,25 @@ def skin_temperature(
         return np.interp(z, z_surface, h_surface)
 
     @BilinearForm
-    def conduction_and_loss(u, v, w):
-        return kt * dot(grad(u), grad(v)) + h_at(w.x[0]) * u * v
+    def conduction(u, v, w):
+        return kt * dot(grad(u), grad(v))
+
+    @BilinearForm
+    def loss_to_air(u, v, w):
+        return h_at(w.x[0]) * u * v
 
     @LinearForm
     def heater(v, w):
         return np.where(np.abs(w.x[0]) <= half, flux, 0.0) * v
 
-    @Functional
-    def loss(w):
-        return h_at(w.x[0]) * w["rise"]
-
-    rise = solve(conduction_and_loss.assemble(basis), heater.assemble(basis))
-    heat_out = float(loss.assemble(basis, rise=basis.interpolate(rise)))
+    # The loss term is lumped: each row is summed onto the diagonal, so every
+    # node loses heat according to its own temperature only. Left as a full
+    # matrix it lets a thin or low-conductivity skin dip below air temperature
+    # beside the heater's edges, which a heated strip cannot do. Lumping keeps
+    # the row sums, so heat out still equals heater power exactly.
+    loss_per_node = np.asarray(loss_to_air.assemble(basis).sum(axis=1)).ravel()
+    rise = solve(conduction.assemble(basis) + diags(loss_per_node), heater.assemble(basis))
+    heat_out = float(loss_per_node @ rise)
     T = air_temperature_k + rise
 
     in_band = np.abs(nodes) <= half + 1e-12

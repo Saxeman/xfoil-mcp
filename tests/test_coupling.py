@@ -133,3 +133,57 @@ def test_heat_transfer_jumps_at_transition(ht):
 def test_lower_surface_stays_laminar_at_4_degrees(ht):
     _, st, result = ht
     assert set(result.regime[st.index + 1:]) == {"laminar"}
+
+
+def test_transition_location_decides_where_the_lower_surface_turns_turbulent():
+    """The laminar lower surface above is an input (xtr_lower=1.0). Move the
+    transition to mid-chord and the regime must follow it."""
+    layer = _parse_bl_file(BL_A4, alpha=4.0)
+    n = layer.n_surface
+    s, x, y, ue, cf = layer.s[:n], layer.x[:n], layer.y[:n], layer.ue[:n], layer.cf[:n]
+    st = stagnation_point(s, x, y, ue)
+    result = heat_transfer(s, x, ue, cf, st, xtr_upper=0.398, xtr_lower=0.5,
+                           chord_m=CHORD, velocity=V, air=AIR)
+    lower = range(st.index + 1, n)
+    assert {result.regime[i] for i in lower if x[i] < 0.45} == {"laminar"}
+    assert {result.regime[i] for i in lower if x[i] > 0.55} == {"turbulent"}
+    assert {result.regime[i] for i in range(st.index + 1) if x[i] > 0.45} == {"turbulent"}   # upper is unchanged
+
+
+def test_turbulent_heat_transfer_is_never_below_the_laminar_value(ht):
+    """At the transition node XFOIL's Cf is still at its laminar low. The
+    turbulent branch takes the larger of the two."""
+    layer = _parse_bl_file(BL_A4, alpha=4.0)
+    n = layer.n_surface
+    s, x, y, ue, cf = layer.s[:n], layer.x[:n], layer.y[:n], layer.ue[:n], layer.cf[:n]
+    st = stagnation_point(s, x, y, ue)
+    laminar_everywhere = heat_transfer(s, x, ue, cf, st, 1.0, 1.0, CHORD, V, AIR)
+    _, _, with_transition = ht
+    assert all(a >= b for a, b in zip(with_transition.h, laminar_everywhere.h))
+
+
+SYMMETRIC = dict(s=[0.0, 0.5, 1.0, 1.5, 2.0], x=[1.0, 0.5, 0.0, 0.5, 1.0],
+                 y=[0.0] * 5, ue=[1.0, 0.5, 0.0, -0.5, -1.0])
+
+
+def test_heat_transfer_is_finite_when_the_stagnation_point_sits_on_a_node():
+    """XFOIL prints Ue to five decimals, so a node at the stagnation point
+    reads exactly 0.00000. The analytic limit there is finite."""
+    st = stagnation_point(**SYMMETRIC)
+    result = heat_transfer(SYMMETRIC["s"], SYMMETRIC["x"], SYMMETRIC["ue"], [0.004] * 5, st,
+                           xtr_upper=1.0, xtr_lower=1.0, chord_m=CHORD, velocity=V, air=AIR)
+    assert all(math.isfinite(h) and h > 0 for h in result.h)
+
+
+def test_the_limit_at_a_resting_node_agrees_with_the_node_beside_it():
+    """The stagnation limit is the same formula taken to zero speed. With Ue
+    linear in distance the two agree exactly, so h must not jump at the node."""
+    st = stagnation_point(**SYMMETRIC)
+    result = heat_transfer(SYMMETRIC["s"], SYMMETRIC["x"], SYMMETRIC["ue"], [0.004] * 5, st,
+                           xtr_upper=1.0, xtr_lower=1.0, chord_m=CHORD, velocity=V, air=AIR)
+    assert result.h[2] == pytest.approx(result.h[3], rel=0.01)
+
+
+def test_a_side_with_no_moving_air_is_a_value_error():
+    with pytest.raises(ValueError, match="zero at every node"):
+        smith_spalding([0.0, 0.1, 0.2], [0.0, 0.0, 0.0], AIR)

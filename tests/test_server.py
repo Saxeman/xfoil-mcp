@@ -21,15 +21,22 @@ Organized by what can go wrong between the harness and the model:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
+import socket
+import subprocess
+import textwrap
+import threading
+import time
 from pathlib import Path
 
 import pytest
 from fastmcp import Client
 
+from builders import FakeDocker
 from xfoil_mcp import harness, server
-from xfoil_mcp.schema import Case, CaseResult, Conditions, Geometry
+from xfoil_mcp.schema import Case, CaseResult, Conditions, Flap, Geometry
 
 ENVELOPE = {"status", "failure_kind", "retry_could_help", "errors"}
 
@@ -89,10 +96,12 @@ def infra_result(case: Case) -> CaseResult:
     )
 
 
-def report(cases, rejected=(), errors=(), killed=False, approval_hash="abc123") -> harness.DryRunReport:
+def report(cases, rejected=(), errors=(), killed=False, approval_hash="abc123",
+           infrastructure=False) -> harness.DryRunReport:
     points = sum(c.conditions.point_count() for c in cases)
     return harness.DryRunReport(
         cases=list(cases), rejected=list(rejected), errors=list(errors), killed=killed,
+        infrastructure=infrastructure,
         estimate=harness.Estimate(case_count=len(cases), alpha_points=points,
                                   expected_seconds=round(len(cases) * 1.5 + points * 0.05, 1)),
         approval_hash=approval_hash,
@@ -320,6 +329,20 @@ def test_run_polar_goes_through_the_harness(monkeypatch):
     assert seen[0].thermal is None
 
 
+def test_a_summary_cannot_override_the_envelope(monkeypatch):
+    """A summary is a container's own dict. Keys it shares with the envelope
+    must not replace the verdict the host validated."""
+    def lying(case, timeout=180.0):
+        return CaseResult(case=case, status="ok", summary={
+            "status": "partial", "failure_kind": "numerical", "retry_could_help": True,
+            "errors": ["from the container"], "best_ld": 104.4,
+        })
+    monkeypatch.setattr(harness.dispatch, "run_case", lying)
+    out = call("run_polar", airfoil="2412", reynolds=1e6)
+    assert (out["status"], out["failure_kind"], out["retry_could_help"], out["errors"]) == ("ok", None, False, [])
+    assert out["best_ld"] == 104.4                  # the rest of the summary still arrives
+
+
 def test_run_polar_summary_reaches_the_model_without_data(monkeypatch):
     monkeypatch.setattr(harness.dispatch, "run_case", lambda c, timeout=180.0: ok_result(c))
     out = call("run_polar", airfoil="2412", reynolds=1e6)
@@ -358,7 +381,9 @@ def test_dry_run_ok_returns_hash_estimate_and_case_views(monkeypatch):
     assert out["estimate"]["case_count"] == 2
     assert out["estimate"]["alpha_points"] == 22
     assert [c["naca"] for c in out["cases"]] == ["2412", "0012"]
-    assert set(out["cases"][0]) == {"content_hash", "label", "naca", "reynolds", "alphas", "outputs"}
+    assert set(out["cases"][0]) == {"content_hash", "label", "naca", "flap", "reynolds", "mach", "n_crit",
+                                    "max_iter", "alphas", "outputs", "thermal"}
+    assert (out["cases"][0]["flap"], out["cases"][0]["thermal"]) == ("none", None)
 
 
 def test_dry_run_with_rejections_keeps_valid_cases_but_no_hash(monkeypatch):
@@ -387,7 +412,7 @@ def test_dry_run_killed_campaign_is_an_input_failure(monkeypatch):
 
 def test_dry_run_docker_failure_is_infrastructure(monkeypatch):
     monkeypatch.setattr(server.harness, "dry_run", lambda s, timeout=30.0: report(
-        [], errors=["docker not found on host"]))
+        [], errors=["docker not found on host"], infrastructure=True))
     out = call("dry_run_campaign", source="src")
     assert out["failure_kind"] == "infrastructure"
     assert out["retry_could_help"] is True
@@ -406,7 +431,7 @@ def test_run_campaign_returns_counts_and_summaries_only(monkeypatch):
                         lambda s, h, case_timeout=180.0: batch(ok_result(c1), partial_result(c2)))
     out = call("run_campaign", source="src", approval_hash="abc123")
 
-    assert out["status"] == "ok"
+    assert (out["status"], out["failure_kind"], out["errors"]) == ("partial", "numerical", [])    # one of two is incomplete
     assert out["complete"] is True
     assert out["submitted"] == 2
     assert out["counts"] == {"ok": 1, "partial": 1, "empty": 0, "error": 0}
@@ -498,7 +523,7 @@ def test_new_campaign_replaces_the_previous_batch(monkeypatch):
 
 # -- Misc Tests
 
-@pytest.mark.parametrize("module", ["server", "harness", "sandbox", "dispatch"])
+@pytest.mark.parametrize("module", ["server", "harness", "sandbox", "dispatch", "containers"])
 def test_host_modules_never_print_to_stdout(module):
     """Over stdio, stdout is the protocol channel. One stray print corrupts
     the stream and every call after it fails."""
@@ -587,6 +612,17 @@ def test_design_returns_a_stage_trace_and_per_alpha_table(monkeypatch):
     assert out["stages"][1]["worst_case"]["at_alpha"] == 10.0
     row = out["per_alpha"][0]
     assert row["cl"] == 0.2371 and row["ice_free_upper_mm"] == 116.6
+
+
+def test_a_summary_cannot_override_the_aero_stage(monkeypatch):
+    def lying(case, timeout=180.0):
+        result = design_result(case)
+        return result.model_copy(update={"summary": {**result.summary, "stage": "thermal", "status": "error"}})
+    monkeypatch.setattr(server.harness, "evaluate", lying)
+    out = call("evaluate_design", **DESIGN)
+    aero = out["stages"][0]
+    assert (aero["stage"], aero["status"]) == ("aero", "ok")
+    assert out["status"] == "ok"
 
 
 def test_failed_aero_means_thermal_is_not_run(monkeypatch):
@@ -717,6 +753,298 @@ def test_design_without_geometry_says_how_to_get_it(printing, monkeypatch):
     assert "geometry" in out["errors"][0]
     assert "run_polar" in out["errors"][0]
 
+@pytest.fixture
+def busy_port(monkeypatch):
+    """A localhost port something else is already listening on, set as the print port."""
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen()
+    monkeypatch.setenv("XFOIL_PRINT_PORT", str(blocker.getsockname()[1]))
+    yield blocker
+    blocker.close()
+
+
+def test_a_busy_print_port_is_reported_and_leaves_nothing_half_started(printing, busy_port, monkeypatch):
+    content_hash = polar_run(monkeypatch)
+    out = call("request_print", content_hash=content_hash)
+    assert (out["status"], out["failure_kind"], out["retry_could_help"]) == ("error", "infrastructure", True)
+    assert "XFOIL_PRINT_PORT" in out["errors"][0]
+    assert server._print_queue is None and server._print_site is None
+
+    busy_port.close()                               # the port frees up; the same call now works
+    again = call("request_print", content_hash=content_hash)
+    assert again["status"] == "ok"
+    assert again["url"].startswith("http://127.0.0.1:")
+
+
+def test_start_print_reports_a_busy_print_port(printing, busy_port):
+    out = call("start_print", request_id="anything")
+    assert (out["status"], out["failure_kind"]) == ("error", "infrastructure")
+    assert out["request_id"] == "anything"
+
+
+def test_concurrent_first_print_calls_start_one_queue_and_one_site(printing, monkeypatch):
+    """Tools run in worker threads. Two first calls must not each build a queue."""
+    from xfoil_mcp import print_site
+
+    real_start, starts = print_site.start_site, []
+
+    def slow_start(queue, port):
+        starts.append(queue)
+        time.sleep(0.05)                            # hold the window open for the other threads
+        return real_start(queue, port)
+    monkeypatch.setattr(print_site, "start_site", slow_start)
+
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(server._printing())) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    assert len(starts) == 1
+    assert len({id(queue) for queue, _ in results}) == 1
+    assert {base for _, base in results} == {server._print_base_url}
+
+
 def test_default_outbox_is_at_the_repository_root():
     repo_root = Path(__file__).resolve().parent.parent
     assert server._default_outbox() == repo_root / "outbox"
+
+
+# ==========================================================================
+# 8. gaps in the sections above
+# ==========================================================================
+
+def assert_envelope(name: str, response: dict) -> None:
+    """The four rules the envelope tests in section 2 apply, for one response."""
+    assert ENVELOPE <= set(response), f"{name} is missing {ENVELOPE - set(response)}"
+    assert response["status"] in ("ok", "partial", "empty", "error"), name
+    assert isinstance(response["errors"], list), name
+    assert response["retry_could_help"] is (response["failure_kind"] == "infrastructure"), name
+    if response["status"] == "ok":
+        assert (response["failure_kind"], response["errors"]) == (None, []), name
+    if response["status"] == "error":
+        assert response["failure_kind"] in ("input", "infrastructure", "numerical"), name
+        assert response["errors"], f"{name} reported an error with no message"
+
+
+def test_the_design_and_print_tools_carry_the_envelope_too(printing, monkeypatch):
+    """Section 2 covers four of the seven tools and has no infrastructure
+    response. These are the other three, with one of each kind of outcome."""
+    responses = {}
+    monkeypatch.setattr(server.harness, "evaluate", lambda c, timeout=180.0: design_result(c))
+    responses["evaluate_design ok"] = call("evaluate_design", **DESIGN)
+    responses["evaluate_design invalid"] = call("evaluate_design", **{**DESIGN, "chord_m": -1})
+    monkeypatch.setattr(server.harness, "evaluate", lambda c, timeout=180.0: design_result(c, aero_status="error"))
+    responses["evaluate_design infrastructure"] = call("evaluate_design", **DESIGN)
+    monkeypatch.setattr(server.harness, "evaluate", lambda c, timeout=180.0: design_result(c, aero_status="partial"))
+    responses["evaluate_design partial"] = call("evaluate_design", **DESIGN)
+
+    responses["request_print unknown"] = call("request_print", content_hash="nope")
+    request = call("request_print", content_hash=polar_run(monkeypatch))
+    responses["request_print ok"] = request
+    responses["request_print oversize"] = call("request_print", content_hash=polar_run(monkeypatch), chord_mm=1000)
+    responses["start_print unapproved"] = call("start_print", request_id=request["request_id"])
+    responses["start_print unknown"] = call("start_print", request_id="nope")
+    part = server._print_queue.get(request["request_id"]).part
+    server._print_queue.approve(request["request_id"], part.sha256)
+    responses["start_print ok"] = call("start_print", request_id=request["request_id"])
+
+    for name, response in responses.items():
+        assert_envelope(name, response)
+    assert {name: r["status"] for name, r in responses.items()} == {
+        "evaluate_design ok": "ok", "evaluate_design invalid": "error",
+        "evaluate_design infrastructure": "error", "evaluate_design partial": "partial",
+        "request_print unknown": "error", "request_print ok": "ok", "request_print oversize": "error",
+        "start_print unapproved": "error", "start_print unknown": "error", "start_print ok": "ok",
+    }
+    assert responses["evaluate_design infrastructure"]["retry_could_help"] is True      # the true side
+    assert responses["evaluate_design invalid"]["retry_could_help"] is False
+
+
+def test_an_unknown_print_request_reports_no_status(printing):
+    out = call("start_print", request_id="nope")
+    assert (out["failure_kind"], out["print_status"], out["request_id"]) == ("input", None, "nope")
+    assert "no print request" in out["errors"][0]
+
+
+def test_detail_cannot_reach_a_design_that_was_not_part_of_a_campaign(monkeypatch):
+    """get_case_detail reads the last campaign only. Documented, and pinned here."""
+    monkeypatch.setattr(harness.dispatch, "run_case", lambda c, timeout=180.0: ok_result(c))
+    content_hash = call("run_polar", airfoil="2412", reynolds=1e6)["content_hash"]
+    assert call("get_case_detail", content_hash=content_hash)["failure_kind"] == "input"
+
+
+def description_example(tool: str) -> str:
+    """The indented code block after "Example:" in a tool description."""
+    lines = list_tools()[tool].splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == "Example:") + 1
+    block = []
+    for line in lines[start:]:
+        if line.strip() and not line[0].isspace():      # prose resumes at the left margin
+            break
+        block.append(line)
+    return textwrap.dedent("\n".join(block)).strip() + "\n"
+
+
+def test_the_campaign_example_in_the_tool_description_runs():
+    """This is the only code sample the model is given for campaigns. It is
+    run here the way the sandbox would run it."""
+    example = description_example("dry_run_campaign")
+    assert "def campaign" in example                    # the extraction found the code
+    namespace = {}
+    exec(compile(example, "<example>", "exec"), namespace)
+    cases = namespace["campaign"]()
+    assert [c.geometry.naca for c in cases] == ["2412", "4412", "0012"]
+    assert all("geometry" in c.outputs for c in cases)
+
+
+def thermal_failed(case) -> CaseResult:
+    """Aero passed, the thermal stage did not: what a missing thermal image produces."""
+    failure = {"status": "error", "failure_kind": "infrastructure",
+               "errors": ["thermal worker exited 125: Unable to find image"], "coverage": 0.0,
+               "worst_case": None, "heater_power_w_per_m": None, "excluded": []}
+    return CaseResult(case=case, status="ok", summary={"converged_points": 11, "thermal": failure},
+                      data={"thermal": {**failure, "points": []}})
+
+
+def test_a_campaign_whose_thermal_stage_failed_is_not_reported_as_ok(monkeypatch):
+    cases = [make_case("2412"), make_case("4412")]
+    monkeypatch.setattr(server.harness, "submit",
+                        lambda s, h, case_timeout=180.0: batch(*[thermal_failed(c) for c in cases]))
+    out = call("run_campaign", source="src", approval_hash="abc123")
+    assert out["status"] != "ok"
+
+
+def test_a_failed_thermal_stage_is_at_least_visible_in_each_case_summary(monkeypatch):
+    """Until the aggregate says so (the test above), this is where it shows."""
+    case = make_case()
+    monkeypatch.setattr(server.harness, "submit", lambda s, h, case_timeout=180.0: batch(thermal_failed(case)))
+    out = call("run_campaign", source="src", approval_hash="abc123")
+    assert out["results"][0]["thermal"]["status"] == "error"
+    assert "Unable to find image" in out["results"][0]["thermal"]["errors"][0]
+
+
+def test_a_campaign_where_every_case_errored_is_not_reported_as_ok(monkeypatch):
+    cases = [make_case("2412"), make_case("4412")]
+    monkeypatch.setattr(server.harness, "submit",
+                        lambda s, h, case_timeout=180.0: batch(*[infra_result(c) for c in cases]))
+    out = call("run_campaign", source="src", approval_hash="abc123")
+    assert out["counts"]["error"] == 2
+    assert out["status"] != "ok"
+
+
+def test_docker_going_away_before_the_run_is_a_retryable_failure(monkeypatch):
+    """The campaign was approved; then Docker stopped. That is not the agent's input.
+    Driven through the real sandbox module, with docker itself missing."""
+    missing = FileNotFoundError("docker")
+    monkeypatch.setattr(subprocess, "run", FakeDocker(run_result=missing, rm_result=missing))
+    out = call("run_campaign", source="src", approval_hash="abc123")
+    assert (out["failure_kind"], out["retry_could_help"]) == ("infrastructure", True)
+    assert out["errors"] == ["campaign is not runnable: docker not found on host"]
+    assert (out["submitted"], out["results"]) == (0, [])
+
+
+def test_a_campaign_error_that_mentions_docker_is_still_an_input_failure(monkeypatch):
+    errors = ["campaign() raised:\nFileNotFoundError: /var/run/docker.sock"]
+    monkeypatch.setattr(server.harness, "dry_run", lambda s, timeout=30.0: report([], errors=errors))
+    out = call("dry_run_campaign", source="src")
+    assert (out["failure_kind"], out["retry_could_help"]) == ("input", False)
+
+
+def test_a_campaign_that_ran_out_of_memory_is_not_told_it_is_looping(monkeypatch):
+    """Driven through the real sandbox module, with the container exiting 137."""
+    monkeypatch.setattr(subprocess, "run", FakeDocker(run_result=FakeDocker.exited(137, stderr="Killed")))
+    out = call("dry_run_campaign", source="src")
+    assert out["failure_kind"] == "input"
+    assert any("memory limit" in e for e in out["errors"])
+    assert not any("looping" in e or "timeout" in e for e in out["errors"])
+
+
+def test_a_campaign_that_ran_out_of_time_is_told_it_is_probably_looping(monkeypatch):
+    monkeypatch.setattr(subprocess, "run", FakeDocker(run_result=subprocess.TimeoutExpired("docker", 30.0)))
+    out = call("dry_run_campaign", source="src")
+    assert out["failure_kind"] == "input"
+    assert any("looping" in e for e in out["errors"])
+
+
+def test_a_missing_sandbox_image_is_an_infrastructure_failure_not_a_looping_campaign(monkeypatch):
+    monkeypatch.setattr(subprocess, "run",
+                        FakeDocker(run_result=FakeDocker.exited(125, stderr="Unable to find image 'xfoil-sandbox'")))
+    out = call("dry_run_campaign", source="src")
+    assert (out["failure_kind"], out["retry_could_help"]) == ("infrastructure", True)
+    assert not any("looping" in e for e in out["errors"])
+
+
+def test_a_mixed_campaign_is_partial_and_names_the_most_actionable_kind(monkeypatch):
+    """One case ok, one whose worker timed out: partial overall, and
+    infrastructure because a retry may help that case."""
+    c1, c2 = make_case("2412"), make_case("4412")
+    monkeypatch.setattr(server.harness, "submit",
+                        lambda s, h, case_timeout=180.0: batch(ok_result(c1), infra_result(c2)))
+    out = call("run_campaign", source="src", approval_hash="abc123")
+    assert (out["status"], out["failure_kind"], out["retry_could_help"]) == ("partial", "infrastructure", True)
+    assert out["counts"] == {"ok": 1, "partial": 0, "empty": 0, "error": 1}
+
+
+def test_a_campaign_where_nothing_was_usable_is_an_error_with_the_results_attached(monkeypatch):
+    cases = [make_case("2412"), make_case("4412")]
+    monkeypatch.setattr(server.harness, "submit",
+                        lambda s, h, case_timeout=180.0: batch(*[infra_result(c) for c in cases]))
+    out = call("run_campaign", source="src", approval_hash="abc123")
+    assert (out["status"], out["failure_kind"]) == ("error", "infrastructure")
+    assert out["errors"] and len(out["results"]) == 2
+    assert_envelope("run_campaign all failed", out)
+
+
+def test_a_thermal_failure_makes_the_case_an_error_in_counts_and_in_its_row(monkeypatch):
+    case = make_case()
+    monkeypatch.setattr(server.harness, "submit", lambda s, h, case_timeout=180.0: batch(thermal_failed(case)))
+    out = call("run_campaign", source="src", approval_hash="abc123")
+    assert out["counts"] == {"ok": 0, "partial": 0, "empty": 0, "error": 1}
+    row = out["results"][0]
+    assert (row["status"], row["failure_kind"], row["retry_could_help"]) == ("error", "infrastructure", True)
+    assert row["converged_points"] == 11                    # the aero numbers are still there
+
+
+def test_the_case_view_shows_the_heater_a_person_is_asked_to_agree_to(monkeypatch):
+    heated = Case(geometry=Geometry(naca="2412"), conditions=make_case().conditions,
+                  outputs=("forces", "bl"), thermal=THERMAL_BLOCK)
+    monkeypatch.setattr(server.harness, "dry_run", lambda s, timeout=30.0: report([heated]))
+    view = call("dry_run_campaign", source="src")["cases"][0]
+    assert view["thermal"]["heater_power_w_per_m"] == 500.0
+    assert (view["mach"], view["n_crit"], view["max_iter"]) == (0.0, 9.0, 100)
+
+
+THERMAL_BLOCK = dict(chord_m=0.5, air_temperature_k=263.15, heater_width=0.1, heater_power_w_per_m=500.0,
+                     skin_thickness_m=0.001, skin_conductivity_w_mk=200.0)
+
+
+def test_cases_that_differ_only_by_a_flap_look_different_at_approval(monkeypatch):
+    """What the person is asked to agree to. Without the flap, these two rows
+    are told apart only by a label the agent wrote."""
+    clean = make_case()
+    flapped = Case(geometry=Geometry(naca="2412", flap=Flap(x_hinge=0.7, deflection=10)),
+                   conditions=clean.conditions, label=clean.label)
+    monkeypatch.setattr(server.harness, "dry_run", lambda s, timeout=30.0: report([clean, flapped]))
+    views = call("dry_run_campaign", source="src")["cases"]
+    strip = lambda v: {k: v[k] for k in v if k != "content_hash"}
+    assert strip(views[0]) != strip(views[1])
+
+
+HOST_MODULES = ["server", "harness", "sandbox", "dispatch", "containers", "printing", "print_site", "cad", "schema"]
+
+
+@pytest.mark.parametrize("module", HOST_MODULES)
+def test_no_host_module_can_write_to_stdout(module):
+    """The scan in section 5 reads four modules and only lines that start
+    with print(. This one parses every module the server process imports and
+    refuses any print() without file=, and any use of sys.stdout at all."""
+    tree = ast.parse((Path(server.__file__).parent / f"{module}.py").read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "print":
+            assert any(k.arg == "file" for k in node.keywords), f"{module}.py:{node.lineno} prints to stdout"
+        if isinstance(node, ast.Attribute) and node.attr == "stdout" and isinstance(node.value, ast.Name) \
+                and node.value.id == "sys":
+            pytest.fail(f"{module}.py:{node.lineno} uses sys.stdout")

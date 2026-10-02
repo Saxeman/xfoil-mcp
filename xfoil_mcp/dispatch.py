@@ -8,15 +8,19 @@ the schema on this side because the container's output is untrusted.
 
 from __future__ import annotations
 
-import os
-import subprocess
-import uuid
 import json
+import os
 
-from xfoil_mcp.schema import Case, CaseResult
+from pydantic import ValidationError
+
+from xfoil_mcp import containers
+from xfoil_mcp.schema import Case, CaseResult, ThermalResult
 
 WORKER_IMAGE = os.environ.get("XFOIL_WORKER_IMAGE", "xfoil-worker")
 THERMAL_IMAGE = os.environ.get("XFOIL_THERMAL_IMAGE", "xfoil-thermal")
+
+# The worker is cut off from the network and nothing more.
+WORKER_FLAGS = ["--network", "none"]
 
 # Same isolation as the sandbox: the code is ours, but its input crossed a
 # container boundary on its way here.
@@ -27,8 +31,6 @@ THERMAL_FLAGS = [
     "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
     "--user", "65534:65534",
 ]
-THERMAL_KEYS = {"status", "failure_kind", "errors", "coverage", "worst_case", "points", "excluded"}
-STATUSES = {"ok", "partial", "empty", "error"}
 
 
 def _infrastructure_failure(case: Case, message: str) -> CaseResult:
@@ -40,78 +42,64 @@ def _infrastructure_failure(case: Case, message: str) -> CaseResult:
         provenance={"content_hash": case.content_hash(), "image": WORKER_IMAGE},
     )
 
-def _thermal_failure(message: str) -> dict:
-    return {
-        "status": "error", "failure_kind": "infrastructure", "errors": [message],
-        "coverage": 0.0, "worst_case": None, "points": [], "excluded": [],
-    }
+def _worker_refusal(stdout: str) -> str | None:
+    """The worker's reason for refusing a case it could not parse, if that is
+    what `stdout` holds: an error object with kind "input" and no case."""
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict) and "case" not in payload \
+            and (payload.get("status"), payload.get("failure_kind")) == ("error", "input"):
+        summary = payload.get("summary")
+        return str(summary.get("error", "")) if isinstance(summary, dict) else ""
+    return None
 
 
-def run_thermal(aero: CaseResult, timeout: float = 120.0) -> dict:
+def _thermal_failure(message: str) -> ThermalResult:
+    return ThermalResult.failure("infrastructure", message)
+
+
+def run_thermal(aero: CaseResult, timeout: float = 120.0) -> ThermalResult:
     """Run the thermal stage for one finished aero result in a fresh container.
 
-    Never raises. The output is checked here because it crossed a container
-    boundary: the expected fields, a known status, and a content hash that
-    matches the case that was sent.
+    Never raises. The output crossed a container boundary, so it is rebuilt
+    through the schema here, and a result that ran must carry the content
+    hash of the case that was sent.
     """
-    name = f"xfoil-thermal-{uuid.uuid4().hex[:12]}"
-    cmd = ["docker", "run", "--rm", "-i", "--name", name, *THERMAL_FLAGS, THERMAL_IMAGE]
+    run = containers.run(THERMAL_IMAGE, aero.model_dump_json(), timeout,
+                         name="xfoil-thermal", flags=THERMAL_FLAGS)
+    if run.proc is None:
+        return _thermal_failure(run.reason("thermal worker"))
+    proc = run.proc
+
+    if proc.returncode != 0:
+        return _thermal_failure(f"thermal worker exited {proc.returncode}: {proc.stderr.strip()[-500:]}")
     try:
-        try:
-            proc = subprocess.run(
-                cmd, input=aero.model_dump_json(), capture_output=True, text=True, timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            return _thermal_failure(f"thermal worker exceeded {timeout}s and was killed")
-        except FileNotFoundError:
-            return _thermal_failure("docker not found on host")
+        out = ThermalResult.model_validate_json(proc.stdout)
+    except ValidationError as exc:
+        return _thermal_failure(
+            f"thermal output was not a ThermalResult: {exc}; stdout[:200]={proc.stdout[:200]!r}"
+        )
 
-        if proc.returncode != 0:
-            return _thermal_failure(f"thermal worker exited {proc.returncode}: {proc.stderr.strip()[-500:]}")
-        try:
-            out = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            return _thermal_failure(f"thermal output was not JSON: {proc.stdout[:200]!r}")
-
-        if not isinstance(out, dict) or not THERMAL_KEYS <= out.keys() or out["status"] not in STATUSES:
-            return _thermal_failure("thermal output did not have the expected shape")
-        if out["status"] != "error" and out.get("content_hash") != aero.case.content_hash():
-            return _thermal_failure("thermal worker returned a result for a different case")
-        return out
-    finally:
-        rm = subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True, timeout=15)
+    if out.status != "error" and out.content_hash != aero.case.content_hash():
+        return _thermal_failure("thermal worker returned a result for a different case")
+    return out
 
 
 def run_case(case: Case, timeout: float = 180.0) -> CaseResult:
     """Run one case in a fresh worker container and return its result.
 
-    The container's output is not trusted: a non-zero exit, output that does
-    not parse as a CaseResult, or a result for a different case each come
-    back as an infrastructure failure. A timeout kills the container by
-    name, because killing the docker client alone leaves it running.
+    Never raises. The container's output is not trusted: a non-zero exit,
+    output that does not parse as a CaseResult, or a result for a different
+    case each come back as an infrastructure failure, as does a timeout or
+    docker failing to start.
     """
-    name = f"xfoil-worker-{uuid.uuid4().hex[:12]}"
-    cmd = [
-        "docker", "run", "--rm", "-i", "--name", name,
-        "--network", "none",
-        WORKER_IMAGE,
-        "python", "-m", "xfoil_mcp.worker",
-    ]
-    try:
-        proc = subprocess.run(
-            cmd,
-            input=case.model_dump_json(),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        # Killing the docker client does not kill the container. A hung XFOIL
-        # would otherwise keep running with no one listening.
-        subprocess.run(["docker", "kill", name], capture_output=True, timeout=10)
-        return _infrastructure_failure(case, f"worker exceeded {timeout}s and was killed")
-    except FileNotFoundError:
-        return _infrastructure_failure(case, "docker not found on host")
+    run = containers.run(WORKER_IMAGE, case.model_dump_json(), timeout, name="xfoil-worker",
+                         flags=WORKER_FLAGS, argv=("python", "-m", "xfoil_mcp.worker"))
+    if run.proc is None:
+        return _infrastructure_failure(case, run.reason("worker"))
+    proc = run.proc
 
     if proc.returncode != 0:
         return _infrastructure_failure(
@@ -121,6 +109,16 @@ def run_case(case: Case, timeout: float = 180.0) -> CaseResult:
     try:
         result = CaseResult.model_validate_json(proc.stdout)
     except Exception as exc:
+        refusal = _worker_refusal(proc.stdout)
+        if refusal is not None:
+            # The host built this case from the schema, so a worker that cannot
+            # parse it was built from a different one. Retrying cannot help.
+            return CaseResult(
+                case=case, status="error", failure_kind="input",
+                summary={"error": "the worker could not parse the case it was sent, which usually means "
+                                  f"its image is older than the schema; rebuild {WORKER_IMAGE}. It said: {refusal}"},
+                provenance={"content_hash": case.content_hash(), "image": WORKER_IMAGE},
+            )
         return _infrastructure_failure(
             case, f"worker output was not a CaseResult: {exc}; stdout[:200]={proc.stdout[:200]!r}"
         )

@@ -20,6 +20,7 @@ fast.
 
 from __future__ import annotations
 
+import re
 import shutil
 
 import pytest
@@ -148,6 +149,15 @@ def test_fine_step_reports_only_genuine_failures():
     result = run_polar("2412", 1e6, 0, 0.5, 0.0625)
     viscal = result.stdout.count("VISCAL:  Convergence failed")
     assert len(result.failed_alphas) == viscal
+    # If nothing fails the line above is 0 == 0, so pin the bookkeeping too:
+    # nine alphas were asked for, each is converged or failed, never both or neither,
+    # and every polar row belongs to an alpha that was requested.
+    assert result.requested_count == 9
+    assert result.converged_count + len(result.failed_alphas) == 9
+    assert result.converged_count >= 1
+    for point in result.points:
+        assert min(abs(point.alpha - a) for a in result.requested_alphas) <= 1e-3
+    assert not {round(p.alpha, 2) for p in result.points} & {round(a, 2) for a in result.failed_alphas}
 
 # --- boundary-layer output --------------------------------------------------
 
@@ -218,6 +228,28 @@ def test_march_failures_are_reported_as_a_number():
     summary = run_polar("2412", 1e6, 0, 4, 2).summary()
     assert isinstance(summary["march_failures"], int)
     assert summary["march_failures"] >= 0
+
+
+def test_march_failures_are_the_ones_xfoil_announced():
+    """The test above passes for any integer. A starved sweep has march
+    failures, and the number reported must be the number XFOIL printed."""
+    result = run_polar(**CASCADE)
+    printed = len(re.findall(r"MRCH(?:DU|UE):\s+Convergence failed", result.stdout))
+    assert printed > 0
+    assert result.march_failures == result.summary()["march_failures"] == printed
+    assert any(w.startswith(f"{printed} boundary-layer march failure(s)") for w in result.warnings)
+
+
+def test_the_iteration_limit_takes_effect():
+    """Positive evidence that ITER landed: the same sweep converges with
+    100 iterations and not with 3."""
+    assert run_polar("2412", 1e6, 0, 4, 2, max_iter=100).status == "ok"
+    assert run_polar("2412", 1e6, 0, 4, 2, max_iter=3).status != "ok"
+
+
+def test_the_iteration_limit_can_be_confirmed_from_stdout():
+    result = run_polar("2412", 1e6, 0, 2, 2, max_iter=37)
+    assert re.search(r"iteration limit:\s+37", result.stdout)
 
 def test_geometry_is_the_outline_xfoil_analysed():
     """Same outline as the step 16 hand export, point for point."""

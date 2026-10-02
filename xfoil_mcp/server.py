@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 
 from fastmcp import FastMCP
 from pydantic import ValidationError
@@ -59,47 +60,73 @@ _designs: dict = {}          # run_polar and evaluate_design results this sessio
 _print_queue = None          # created on the first print request
 _print_site = None
 _print_base_url = None
+_print_lock = threading.Lock()   # tools run in worker threads; only one may start the queue
 
 # --- envelope --------------------------------------------------------------
 
+def _envelope(status: str, kind: FailureKind | None, errors: list[str], /, **fields) -> dict:
+    """The four keys every response carries, then the tool's own fields.
+
+    The envelope is authoritative. Fields often come from a container's
+    summary, so one that shares a name with an envelope key is dropped
+    rather than allowed to change the verdict. The parameters are
+    positional-only so that such a field cannot collide with them either.
+    """
+    envelope = {"status": status, "failure_kind": kind,
+                "retry_could_help": kind == "infrastructure", "errors": errors}
+    return {**envelope, **{k: v for k, v in fields.items() if k not in envelope}}
+
+
 def _ok(**fields) -> dict:
-    return {"status": "ok", "failure_kind": None, "retry_could_help": False, "errors": [], **fields}
+    return _envelope("ok", None, [], **fields)
 
 
-def _error(kind: FailureKind, errors: list[str], **fields) -> dict:
-    return {
-        "status": "error",
-        "failure_kind": kind,
-        "retry_could_help": kind == "infrastructure",
-        "errors": errors,
-        **fields,
-    }
+def _error(kind: FailureKind, errors: list[str], /, **fields) -> dict:
+    return _envelope("error", kind, errors, **fields)
 
 
-def _validation_errors(exc: ValidationError) -> list[str]:
-    return [f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()]
+def _validation_errors(exc: ValidationError, names: dict[str, str] | None = None) -> list[str]:
+    """One "location: message" line per error.
+
+    `names` maps schema paths to the tool's argument names, so the caller is
+    told which argument was wrong in its own terms. A path it does not list
+    is reported as the schema path.
+    """
+    names = names or {}
+    lines = []
+    for e in exc.errors():
+        location = ".".join(str(p) for p in e["loc"])
+        lines.append(f"{names.get(location, location)}: {e['msg']}")
+    return lines
+
+
+def _flap_text(flap) -> str:
+    return "none" if flap is None else f"{flap.deflection:g} deg at {flap.x_hinge:.0%} chord"
 
 
 def _case_view(cases: list[Case]) -> list[dict]:
-    """What the model sees per case: enough to recognize it, not the whole object."""
+    """What the model, and through it the person approving, sees per case.
+
+    Everything that makes one solver run differ from another is here, so two
+    cases never look alike unless they are. The label is written by the
+    agent and cannot be what tells them apart.
+    """
     return [
         {
             "content_hash": c.content_hash(),
             "label": c.label,
             "naca": c.geometry.naca,
+            "flap": _flap_text(c.geometry.flap),
             "reynolds": c.conditions.reynolds,
+            "mach": c.conditions.mach,
+            "n_crit": c.conditions.n_crit,
+            "max_iter": c.conditions.max_iter,
             "alphas": f"{c.conditions.alpha_start}..{c.conditions.alpha_end} step {c.conditions.alpha_step}",
             "outputs": list(c.outputs),
+            "thermal": None if c.thermal is None else c.thermal.model_dump(mode="json"),
         }
         for c in cases
     ]
-
-def _argument_errors(exc: ValidationError) -> list[str]:
-    out = []
-    for e in exc.errors():
-        location = ".".join(str(p) for p in e["loc"])
-        out.append(f"{_ARGUMENT_NAMES.get(location, location)}: {e['msg']}")
-    return out
 
 
 def _per_alpha(result) -> list[dict]:
@@ -120,8 +147,8 @@ def _per_alpha(result) -> list[dict]:
 
 def _design_response(case, result) -> dict:
     """The stage trace. Overall status comes from the first stage that did not pass."""
-    aero = {"stage": "aero", "status": result.status, "failure_kind": result.failure_kind,
-            **{k: v for k, v in result.summary.items() if k not in _AERO_HIDDEN}}
+    aero = {"stage": "aero", "status": result.status, "failure_kind": result.failure_kind}
+    aero.update((k, v) for k, v in result.summary.items() if k not in _AERO_HIDDEN and k not in aero)
     if result.status in ("error", "empty"):
         thermal = {"stage": "thermal", "status": "not_run",
                    "reason": f"aero stage did not pass (status {result.status})"}
@@ -138,8 +165,7 @@ def _design_response(case, result) -> dict:
         return _error(thermal["failure_kind"] or "infrastructure",
                       thermal["errors"] or ["thermal stage failed"], **fields)
     if "partial" in (result.status, thermal["status"]) or thermal["status"] == "empty":
-        return {"status": "partial", "failure_kind": "numerical", "retry_could_help": False,
-                "errors": [], **fields}
+        return _envelope("partial", "numerical", [], **fields)
     return _ok(**fields)
 
 # --- printing ----------------------------------------------------------------
@@ -160,20 +186,34 @@ def _printing():
     Imported lazily: CadQuery takes seconds to load, and the MCP server should
     start instantly. The outbox defaults to a fixed folder because Claude
     Desktop starts this server from an unpredictable working directory.
+
+    Nothing is published until the page has bound its port, so a failed
+    start leaves no half-built state and the next call tries again. Raises
+    OSError if the port cannot be bound and ValueError if XFOIL_PRINT_PORT
+    is not a number.
     """
     global _print_queue, _print_site, _print_base_url
-    if _print_queue is None:
-        import os
-        from pathlib import Path
+    with _print_lock:
+        if _print_queue is None:
+            import os
+            from pathlib import Path
 
-        from xfoil_mcp.print_site import start_site
-        from xfoil_mcp.printing import DryBackend, PrintQueue
+            from xfoil_mcp.print_site import start_site
+            from xfoil_mcp.printing import DryBackend, PrintQueue
 
-        outbox = Path(os.environ.get("XFOIL_PRINT_OUTBOX", _default_outbox()))
-        port = int(os.environ.get("XFOIL_PRINT_PORT", "8765"))
-        _print_queue = PrintQueue(DryBackend(outbox))
-        _print_site, _print_base_url = start_site(_print_queue, port)
-    return _print_queue, _print_base_url
+            outbox = Path(os.environ.get("XFOIL_PRINT_OUTBOX", _default_outbox()))
+            port = int(os.environ.get("XFOIL_PRINT_PORT", "8765"))
+            queue = PrintQueue(DryBackend(outbox))
+            site, base_url = start_site(queue, port)
+            _print_queue, _print_site, _print_base_url = queue, site, base_url
+        return _print_queue, _print_base_url
+
+
+def _print_unavailable(exc: Exception, **fields) -> dict:
+    """The response when the queue and its review page could not be started."""
+    return _error("infrastructure",
+                  [f"could not start the print review page: {exc}; "
+                   "set XFOIL_PRINT_PORT to a free port and try again"], **fields)
 
 
 def _find_design(content_hash: str):
@@ -256,14 +296,8 @@ def run_polar(
             [result.summary.get("error", "unknown error")],
             content_hash=case.content_hash(),
         )
-    return {
-        "status": result.status,
-        "failure_kind": result.failure_kind,
-        "retry_could_help": result.retry_could_help,
-        "errors": [],
-        "content_hash": case.content_hash(),
-        **result.summary,
-    }
+    return _envelope(result.status, result.failure_kind, [],
+                     content_hash=case.content_hash(), **result.summary)
 
 
 
@@ -340,7 +374,7 @@ def evaluate_design(
             },
         })
     except ValidationError as exc:
-        return _error("input", _argument_errors(exc), content_hash=None, stages=[], per_alpha=[])
+        return _error("input", _validation_errors(exc, _ARGUMENT_NAMES), content_hash=None, stages=[], per_alpha=[])
     result = harness.evaluate(case)
     _designs[case.content_hash()] = result
     return _design_response(case, result)
@@ -386,12 +420,15 @@ def request_print(content_hash: str, chord_mm: float = 150.0, span_mm: float = 4
     design = {
         "label": case.label or f"NACA {case.geometry.naca}",
         "airfoil": case.geometry.naca,
-        "flap": "none" if flap is None else f"{flap.deflection:g} deg at {flap.x_hinge:.0%} chord",
+        "flap": _flap_text(flap),
         "reynolds": f"{case.conditions.reynolds:g}",
         "coldest_heater_temperature_c": (thermal.get("worst_case") or {}).get("min_heated_temperature_c"),
         "design_hash": content_hash[:12],
     }
-    queue, base = _printing()
+    try:
+        queue, base = _printing()
+    except (OSError, ValueError) as exc:
+        return _print_unavailable(exc)
     request = queue.create(design, part)
     return _ok(request_id=request.id, url=f"{base}/print/{request.id}",
                sha256=part.sha256[:12], stats=part.stats, print_status=request.status)
@@ -411,7 +448,10 @@ def start_print(request_id: str) -> dict:
     """
     from xfoil_mcp.printing import PrintRefused
 
-    queue, _ = _printing()
+    try:
+        queue, _ = _printing()
+    except (OSError, ValueError) as exc:
+        return _print_unavailable(exc, request_id=request_id, print_status=None)
     try:
         sent = queue.start(request_id)
     except PrintRefused as exc:
@@ -447,8 +487,8 @@ def dry_run_campaign(source: str) -> dict:
             return [
                 Case(geometry=Geometry(naca=n),
                      conditions=Conditions(reynolds=5e5, alpha_start=0,
-                                           alpha_end=12, alpha_step=1,
-                                           outputs=("forces", "geometry")),
+                                           alpha_end=12, alpha_step=1),
+                     outputs=("forces", "geometry"),
                      label=n)
                 for n in ("2412", "4412", "0012")
             ]
@@ -464,14 +504,13 @@ def dry_run_campaign(source: str) -> dict:
     report = harness.dry_run(source)
 
     if not report.runnable:
-        infra = any("docker" in e.lower() for e in report.errors)
         errors = list(report.errors) + list(report.rejected)
         if report.killed:
             errors.append("campaign was killed by the sandbox timeout; it is probably looping")
         if not report.cases and not errors:
             errors.append("campaign() returned no cases")
         return _error(
-            "infrastructure" if infra else "input",
+            "infrastructure" if report.infrastructure else "input",
             errors,
             cases=_case_view(report.cases),
             approval_hash=None,
@@ -494,24 +533,35 @@ def run_campaign(source: str, approval_hash: str) -> dict:
     dry-run again. Returns one summary per case, never full polar tables;
     use get_case_detail for those.
 
-    Read `complete` and `counts` before drawing conclusions. A case with
-    failure_kind "numerical" will fail again if rerun identically; only a
-    changed approach (smaller step, different range) can help. A case with
-    failure_kind "infrastructure" may succeed on retry.
+    status is "ok" only when every case passed every stage it asked for,
+    "partial" when some did, and "error" when none produced a usable result.
+    Read `complete` and `counts` before drawing conclusions: counts are of
+    each case's overall status, so a case whose aero passed and whose heater
+    analysis failed counts as an error. A case with failure_kind "numerical"
+    will fail again if rerun identically; only a changed approach (smaller
+    step, different range) can help. A case with failure_kind
+    "infrastructure" may succeed on retry.
     """
     global _last_batch
+    refused = dict(complete=False, submitted=0, counts={}, results=[])
     try:
         batch = harness.submit(source, approval_hash)
+    except harness.CampaignNotRunnable as exc:
+        return _error(exc.failure_kind, [str(exc)], **refused)
     except harness.ApprovalMismatch as exc:
-        return _error("input", [str(exc)], complete=False, submitted=0, counts={}, results=[])
+        return _error("input", [str(exc)], **refused)
 
     _last_batch = batch
-    return _ok(
-        complete=batch.complete,
-        submitted=batch.submitted,
-        counts=batch.counts,
-        results=batch.summaries(),
-    )
+    counts = batch.counts
+    fields = dict(complete=batch.complete, submitted=batch.submitted, counts=counts,
+                  results=batch.summaries())
+    if counts["ok"] == batch.submitted:
+        return _ok(**fields)
+    if counts["ok"] + counts["partial"] == 0:
+        return _error(batch.failure_kind,
+                      ["no case produced a usable result; each case's status and error are in results"],
+                      **fields)
+    return _envelope("partial", batch.failure_kind, [], **fields)
 
 
 @mcp.tool

@@ -24,6 +24,8 @@ log = logging.getLogger(__name__)
 THREE = "https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"
 STL_LOADER = "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"
 
+MAX_BODY_BYTES = 4096       # a decision is {"sha256": 64 hex characters}; nothing larger is read
+
 
 def _rows(items: dict) -> str:
     e = html.escape
@@ -162,11 +164,20 @@ def _handler(queue: PrintQueue):
             # a JSON request. Requiring JSON means only this page can decide.
             if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 return self._json(415, {"error": "decisions must be sent as JSON"})
-            length = int(self.headers.get("Content-Length", "0"))
+            # Anything but a small JSON object is refused with a reply. Left
+            # to raise, a bad header or body closes the connection without one.
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._json(400, {"error": "Content-Length was not a number"})
+            if not 0 <= length <= MAX_BODY_BYTES:
+                return self._json(400, {"error": f"body must be at most {MAX_BODY_BYTES} bytes"})
             try:
                 body = json.loads(self.rfile.read(length) or b"{}")
-            except json.JSONDecodeError:
+            except ValueError:              # not JSON, or not UTF-8
                 return self._json(400, {"error": "body was not JSON"})
+            if not isinstance(body, dict):
+                return self._json(400, {"error": "body must be a JSON object"})
 
             request_id, action = route
             try:

@@ -11,6 +11,7 @@ so a stray print corrupts the payload. Diagnostics go to stderr.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import sys
 import time
@@ -51,7 +52,7 @@ def run_case(case: Case) -> CaseResult:
 
     c = case.conditions
     f = case.geometry.flap
-    flap = None if f is None else (f.x_hinge, f.y_hinge, f.deflection)
+    flap = None if f is None else (f.x_hinge, case.geometry.hinge_y(), f.deflection)
 
     try:
         polar = run_polar(
@@ -103,11 +104,14 @@ def main() -> int:
         case = Case.model_validate_json(raw)
     except Exception as exc:
         # The host validated this before sending, so reaching here means the
-        # contract is broken somewhere. Still return a result, not a crash.
-        print(
-            '{"status": "error", "failure_kind": "input", '
-            f'"summary": {{"error": "unparseable case: {str(exc)!r}"}}}}',
-        )
+        # contract is broken somewhere: most likely this image was built from
+        # an older schema. There is no Case to attach, so this cannot be a
+        # CaseResult; the host recognises the shape (dispatch._worker_refusal).
+        sys.stdout.write(json.dumps({
+            "status": "error", "failure_kind": "input",
+            "summary": {"error": f"unparseable case: {exc}"},
+        }))
+        sys.stdout.flush()
         return 0
 
     try:

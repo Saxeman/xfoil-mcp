@@ -14,11 +14,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MAX_ALPHA_POINTS = 200
+THERMAL_MAX_MACH = 0.3      # the heater model, and XFOIL's solve under it, assume slow air
 
 Output = Literal["forces", "cp", "bl", "geometry"]
 Status = Literal["ok", "partial", "empty", "error"]
@@ -26,10 +28,11 @@ FailureKind = Literal["input", "infrastructure", "numerical"]
 
 
 class _Strict(BaseModel):
-    """Reject unknown fields. A typo in a campaign should fail loudly, not be
-    silently dropped."""
+    """Reject unknown fields and non-finite numbers. A typo in a campaign
+    should fail loudly, not be silently dropped, and inf or NaN is never a
+    physical value."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
 
 class Flap(_Strict):
@@ -37,10 +40,14 @@ class Flap(_Strict):
 
     x_hinge and y_hinge are chord fractions. deflection is in degrees,
     positive for trailing edge down (which increases lift).
+
+    y_hinge left out means "on the camber line", which is inside every
+    section. The chord line (y = 0) is not: it runs below the lower surface
+    of a strongly cambered airfoil. Geometry.hinge_y gives the height used.
     """
 
     x_hinge: float = Field(ge=0.5, le=0.9)
-    y_hinge: float = Field(default=0.0, ge=-0.5, le=0.5)
+    y_hinge: float | None = Field(default=None, ge=-0.5, le=0.5)
     deflection: float = Field(ge=-45.0, le=45.0)
 
 class Thermal(_Strict):
@@ -71,8 +78,32 @@ class Thermal(_Strict):
     )
 
 
+# The 5-digit mean lines XFOIL builds, as (r, k1): camber ends at x = r.
+_NACA5_MEAN_LINES = {
+    "210": (0.0580, 361.400), "220": (0.1260, 51.640), "230": (0.2025, 15.957),
+    "240": (0.2900, 6.643), "250": (0.3910, 3.230),
+}
+
+
+def camber_line(naca: str, x: float) -> float:
+    """Height of the mean line at chord fraction x, as a chord fraction, for
+    any designation Geometry accepts."""
+    if len(naca) == 4:
+        m, p = int(naca[0]) / 100, int(naca[1]) / 10
+        if m == 0 or p == 0:
+            return 0.0
+        if x < p:
+            return m / p**2 * (2 * p * x - x * x)
+        return m / (1 - p)**2 * (1 - 2 * p + 2 * p * x - x * x)
+    r, k1 = _NACA5_MEAN_LINES[naca[:3]]
+    if x < r:
+        return k1 / 6 * (x**3 - 3 * r * x**2 + r**2 * (3 - r) * x)
+    return k1 * r**3 / 6 * (1 - x)
+
+
 class Geometry(_Strict):
-    """What airfoil to analyze. NACA 4- and 5-digit designations only, for now."""
+    """What airfoil to analyze: a NACA 4-digit section, or a 5-digit section
+    from the families XFOIL builds (210, 220, 230, 240, 250)."""
 
     naca: str
     flap: Flap | None = None
@@ -81,11 +112,29 @@ class Geometry(_Strict):
     @classmethod
     def _valid_naca(cls, value: str) -> str:
         value = value.strip()
-        if not value.isdigit() or len(value) not in (4, 5):
+        # ASCII digits only: str.isdigit also accepts digits from other scripts.
+        if not re.fullmatch(r"[0-9]{4,5}", value):
             raise ValueError(f"naca must be 4 or 5 digits, got {value!r}")
-        if len(value) == 4 and int(value[2:]) == 0:
-            raise ValueError("4-digit NACA thickness must be non-zero")
+        if len(value) == 5 and value[:3] not in _NACA5_MEAN_LINES:
+            raise ValueError(
+                f"5-digit naca must start with one of {', '.join(_NACA5_MEAN_LINES)} "
+                f"(for example 23012), got {value!r}"
+            )
+        if int(value[-2:]) == 0:
+            raise ValueError("NACA thickness (the last two digits) must be non-zero")
         return value
+
+    def hinge_y(self) -> float | None:
+        """Height of the flap hinge as a chord fraction; None without a flap.
+
+        The flap's own y_hinge if it gives one, otherwise the camber line at
+        x_hinge, to the five decimals XFOIL echoes it back with.
+        """
+        if self.flap is None:
+            return None
+        if self.flap.y_hinge is not None:
+            return self.flap.y_hinge
+        return round(camber_line(self.naca, self.flap.x_hinge), 5)
 
 
 class Conditions(_Strict):
@@ -109,6 +158,12 @@ class Conditions(_Strict):
     def _sweep_is_sane(self) -> Conditions:
         if self.alpha_end < self.alpha_start:
             raise ValueError("alpha_end must be >= alpha_start")
+        span = self.alpha_end - self.alpha_start
+        if 0 < span < self.alpha_step:
+            raise ValueError(
+                f"alpha_step {self.alpha_step} is larger than the sweep "
+                f"({self.alpha_start} to {self.alpha_end}); only alpha_start would be solved"
+            )
         if self.point_count() > MAX_ALPHA_POINTS:
             raise ValueError(
                 f"sweep has {self.point_count()} points; limit is {MAX_ALPHA_POINTS}"
@@ -130,6 +185,18 @@ class Conditions(_Strict):
             round(self.alpha_start + i * self.alpha_step, 6)
             for i in range(self.point_count())
         ]
+
+
+def _without_negative_zero(value):
+    """-0.0 and 0.0 are the same number, but JSON writes them differently.
+    Two cases that differ only by that sign are the same run and must hash the same."""
+    if isinstance(value, float):
+        return value + 0.0
+    if isinstance(value, dict):
+        return {k: _without_negative_zero(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_without_negative_zero(v) for v in value]
+    return value
 
 
 class Case(_Strict):
@@ -160,6 +227,11 @@ class Case(_Strict):
         edge velocity, which only exist when the case asks for them."""
         if self.thermal is not None and "bl" not in self.outputs:
             raise ValueError("thermal requires 'bl' in outputs")
+        if self.thermal is not None and self.conditions.mach > THERMAL_MAX_MACH:
+            raise ValueError(
+                f"thermal requires mach <= {THERMAL_MAX_MACH}: the heater model assumes "
+                f"low-speed air, and XFOIL would solve this case at Mach {self.conditions.mach:g}"
+            )
         return self
 
     def content_hash(self) -> str:
@@ -168,12 +240,22 @@ class Case(_Strict):
         Excludes `label`: two cases that would produce identical solver runs
         must collide regardless of what the agent called them.
         """
-        payload = self.model_dump(exclude={"label"}, mode="json")
+        payload = _without_negative_zero(self.model_dump(exclude={"label"}, mode="json"))
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     def alphas(self) -> list[float]:
         return self.conditions.alphas()
+
+
+def _check_status_and_kind(status: str, failure_kind: str | None) -> None:
+    """The one rule tying a status to its failure kind, for every result type."""
+    if status == "ok" and failure_kind is not None:
+        raise ValueError("an ok result cannot carry a failure_kind")
+    if status in ("partial", "empty") and failure_kind != "numerical":
+        raise ValueError(f"{status} results are numerical failures")
+    if status == "error" and failure_kind is None:
+        raise ValueError("error results must say what kind of failure")
 
 
 class CaseResult(_Strict):
@@ -192,12 +274,7 @@ class CaseResult(_Strict):
 
     @model_validator(mode="after")
     def _status_and_kind_agree(self) -> CaseResult:
-        if self.status == "ok" and self.failure_kind is not None:
-            raise ValueError("an ok result cannot carry a failure_kind")
-        if self.status in ("partial", "empty") and self.failure_kind != "numerical":
-            raise ValueError(f"{self.status} results are numerical failures")
-        if self.status == "error" and self.failure_kind is None:
-            raise ValueError("error results must say what kind of failure")
+        _check_status_and_kind(self.status, self.failure_kind)
         return self
 
     @property
@@ -208,3 +285,35 @@ class CaseResult(_Strict):
         failure. Input failures will never succeed.
         """
         return self.failure_kind == "infrastructure"
+
+
+class ThermalResult(_Strict):
+    """What the thermal stage returns for one finished aero result.
+
+    Lives here for the same reason as CaseResult: the thermal container
+    constructs it and the host deserializes it. `points` holds one entry per
+    alpha that passed every gate, `excluded` one per alpha that did not, with
+    the reason, and `coverage` is the share of requested alphas in `points`.
+    """
+
+    status: Status
+    failure_kind: FailureKind | None
+    errors: list[str]
+    coverage: float = Field(ge=0.0, le=1.0)
+    worst_case: dict | None
+    points: list[dict]
+    excluded: list[dict]
+    heater_power_w_per_m: float | None = None
+    velocity_m_s: float | None = None
+    content_hash: str | None = None     # of the case it answers; set once the stage ran
+
+    @model_validator(mode="after")
+    def _status_and_kind_agree(self) -> ThermalResult:
+        _check_status_and_kind(self.status, self.failure_kind)
+        return self
+
+    @classmethod
+    def failure(cls, kind: FailureKind, message: str) -> ThermalResult:
+        """A stage that produced nothing, and why."""
+        return cls(status="error", failure_kind=kind, errors=[message],
+                   coverage=0.0, worst_case=None, points=[], excluded=[])

@@ -9,7 +9,7 @@ import pytest
 import shutil
 
 from xfoil_mcp.wrapper import (
-    BoundaryLayer, CpDistribution, PolarPoint, PolarResult, _collect_fields, _parse_bl_file, _parse_cp_file, _drop_non_finite, _parse_coords_file
+    BoundaryLayer, CpDistribution, PolarPoint, PolarResult, _collect_fields, _scan_stdout, _parse_bl_file, _parse_cp_file, _drop_non_finite, _parse_coords_file
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -164,6 +164,17 @@ def test_polar_rows_with_non_finite_values_are_dropped():
     assert dropped == [1.0]
 
 
+def test_dropping_non_finite_rows_keeps_order_and_equal_rows():
+    """Rows are judged one at a time: two identical good rows both stay, and
+    every bad row is reported, in the order the polar listed them."""
+    good = PolarPoint(alpha=0.0, cl=0.24, cd=0.0056, cdp=0.0005, cm=-0.05, top_xtr=0.65, bot_xtr=0.68)
+    nan_cl = PolarPoint(alpha=1.0, cl=float("nan"), cd=0.0055, cdp=0.0006, cm=-0.05, top_xtr=0.59, bot_xtr=0.86)
+    inf_cd = PolarPoint(alpha=2.0, cl=0.45, cd=float("inf"), cdp=0.0006, cm=-0.05, top_xtr=0.52, bot_xtr=0.91)
+    kept, dropped = _drop_non_finite([inf_cd, good, nan_cl, good])
+    assert kept == [good, good]
+    assert dropped == [2.0, 1.0]
+
+
 @pytest.mark.parametrize("zero_drag_first", [True, False])
 def test_best_ld_ignores_a_zero_drag_row_wherever_it_sits(zero_drag_first):
     """L/D is undefined at zero drag, and max() over a NaN key depends on order."""
@@ -173,6 +184,43 @@ def test_best_ld_ignores_a_zero_drag_row_wherever_it_sits(zero_drag_first):
     summary = PolarResult(airfoil="2412", reynolds=1e6, mach=0.0, n_crit=9.0, max_iter=100,
                           requested_alphas=[0.0, 1.0], points=points).summary()
     assert (summary["best_ld"], summary["best_ld_alpha"]) == (90.0, 1.0)
+
+# --- stdout evidence ---------------------------------------------------------
+
+ECHO_100 = ".OPERi   c>   Current iteration limit:         100\n"      # what a bare ITER prints
+
+def test_clean_stdout_has_no_warnings_and_no_march_failures():
+    stdout = ECHO_100 + " Side 1 forced transition at x/c =  1.0000\n"
+    assert _scan_stdout(stdout, requested_max_iter=100) == ([], 0)
+
+
+def test_a_run_that_never_echoes_the_iteration_limit_is_suspect():
+    """The script asks for the limit back, so XFOIL always prints it. No
+    echo means the commands did not land where they were meant to."""
+    warnings, _ = _scan_stdout(" Side 1 forced transition at x/c =  1.0000\n", requested_max_iter=100)
+    assert warnings == ["XFOIL never echoed the iteration limit; the input sequence may have desynchronized"]
+
+
+def test_march_failures_are_counted_once_and_reported():
+    """Both march routines count, and the warning carries the same number the
+    result reports as march_failures."""
+    stdout = (ECHO_100
+              + " MRCHUE: Convergence failed at   87  side 1    Res =  0.1E+00\n"
+              " MRCHDU: Convergence failed at   90  side 2    Res =  0.3E-01\n"
+              " MRCHDU: Convergence failed at   91  side 2    Res =  0.2E-01\n")
+    warnings, march_failures = _scan_stdout(stdout, requested_max_iter=100)
+    assert march_failures == 3
+    assert warnings == ["3 boundary-layer march failure(s) during solves "
+                        "(some points may have converged from a poor path)"]
+
+
+def test_viscal_failures_and_a_wrong_iteration_limit_are_reported():
+    stdout = (" Current iteration limit:  20\n"
+              " VISCAL:  Convergence failed\n VISCAL:  Convergence failed\n")
+    warnings, march_failures = _scan_stdout(stdout, requested_max_iter=100)
+    assert march_failures == 0
+    assert warnings == ["2 point(s) reported VISCAL convergence failure",
+                        "iteration limit reads 20, requested 100"]
 
 # --- geometry ----------------------------------------------------------------
 

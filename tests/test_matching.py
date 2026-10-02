@@ -7,7 +7,8 @@ written as 0.062. Exact matching reported such points as failed.
 import pytest
 
 from xfoil_mcp.wrapper import (
-    MIN_ALPHA_STEP, POLAR_ALPHA_RESOLUTION, PolarPoint, _expected_alphas, _match_alphas, _check_geometry_applied, XfoilError
+    MIN_ALPHA_STEP, POLAR_ALPHA_RESOLUTION, InvalidGeometry, PolarPoint, XfoilError,
+    _check_geometry_applied, _expected_alphas, _match_alphas,
 )
 
 MISMATCH = " Buffer airfoil is not identical to current airfoil\n"
@@ -71,3 +72,44 @@ def test_no_flap_requested_means_nothing_to_check():
 def test_hinge_outside_the_airfoil_is_an_error():
     with pytest.raises(XfoilError):
         _check_geometry_applied(xfoil_says(0.3), flap=(0.7, 0.3, 10.0))
+
+
+def test_a_hinge_outside_the_airfoil_is_invalid_geometry_specifically():
+    """The worker turns InvalidGeometry into an "input" failure and every
+    other XfoilError into a retryable "infrastructure" one. The test above
+    would pass for either."""
+    for y_hinge in (0.3, -0.3, 0.0516, -0.0216):               # above, below, and on each surface
+        with pytest.raises(InvalidGeometry):
+            _check_geometry_applied(xfoil_says(y_hinge), flap=(0.7, y_hinge, 10.0))
+
+
+def test_a_flap_that_stayed_in_the_buffer_is_an_error():
+    """The hinge was echoed, so FLAP ran, but EXEC never copied the buffer to
+    the airfoil that gets analysed."""
+    stayed = xfoil_says(0.0).replace(" Current airfoil nodes set from buffer airfoil nodes ( 248 )\n", "")
+    with pytest.raises(XfoilError, match="never reached the analysis"):
+        _check_geometry_applied(stayed, flap=FLAP)
+
+
+def test_a_buffer_mismatch_warning_is_an_error_even_after_exec():
+    with pytest.raises(XfoilError, match="never reached the analysis"):
+        _check_geometry_applied(xfoil_says(0.0) + MISMATCH, flap=FLAP)
+
+
+def test_a_hinge_applied_somewhere_else_is_an_error():
+    with pytest.raises(XfoilError, match="requested"):
+        _check_geometry_applied(xfoil_says(0.0), flap=(0.8, 0.0, 10.0))        # echoed at 0.7
+
+
+def test_a_flap_without_the_surface_report_is_an_error():
+    """Without Top and Bottom there is no way to tell whether the hinge is inside."""
+    no_surfaces = "\n".join(l for l in xfoil_says(0.0).splitlines() if "surface:" not in l) + "\n"
+    with pytest.raises(XfoilError, match="did not report the surface"):
+        _check_geometry_applied(no_surfaces, flap=FLAP)
+
+
+def test_only_a_bad_hinge_is_invalid_geometry():
+    """Evidence problems are not the caller's fault."""
+    with pytest.raises(XfoilError) as caught:
+        _check_geometry_applied(" nothing about flaps here\n", flap=FLAP)
+    assert not isinstance(caught.value, InvalidGeometry)
