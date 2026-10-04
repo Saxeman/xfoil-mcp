@@ -12,3 +12,4 @@ outbox/
 .DS_Store/
 docs/
 changes.MD
+*.env
