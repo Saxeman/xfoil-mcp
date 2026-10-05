@@ -27,7 +27,16 @@ APPROVAL_TTL_S = 30 * 60
 
 
 class PrintRefused(Exception):
-    """A request cannot move to the state asked for. The message says why."""
+    """A request cannot move to the state asked for. The message says why.
+
+    failure_kind says who has to act: "input" when the request itself can't
+    be printed (not approved, expired, already used), "infrastructure" when a
+    backend failed to send it.
+    """
+
+    def __init__(self, message: str, failure_kind: str = "input"):
+        super().__init__(message)
+        self.failure_kind = failure_kind
 
 
 @dataclass
@@ -136,7 +145,11 @@ class PrintQueue:
             request.result = self._backend.send(request)
         except Exception as exc:
             request.status = "failed"
-            raise PrintRefused(f"the {self._backend.name} backend failed: {exc}") from exc
+            # The request is used up either way: printing it again takes a new
+            # request and a new approval, so a person looks at it again.
+            raise PrintRefused(f"the {self._backend.name} backend failed: {exc}. This request is "
+                               "closed; request the print again once the cause is fixed",
+                               failure_kind=getattr(exc, "failure_kind", "infrastructure")) from exc
         return request.result
 
     def _find(self, request_id: str) -> PrintRequest:

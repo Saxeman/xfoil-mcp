@@ -199,21 +199,40 @@ def _printing():
             from pathlib import Path
 
             from xfoil_mcp.print_site import start_site
-            from xfoil_mcp.printing import DryBackend, PrintQueue
+            from xfoil_mcp.printing import PrintQueue
 
             outbox = Path(os.environ.get("XFOIL_PRINT_OUTBOX", _default_outbox()))
             port = int(os.environ.get("XFOIL_PRINT_PORT", "8765"))
-            queue = PrintQueue(DryBackend(outbox))
+            queue = PrintQueue(_backend(os.environ, outbox))
             site, base_url = start_site(queue, port)
             _print_queue, _print_site, _print_base_url = queue, site, base_url
         return _print_queue, _print_base_url
 
-
 def _print_unavailable(exc: Exception, **fields) -> dict:
-    """The response when the queue and its review page could not be started."""
-    return _error("infrastructure",
-                  [f"could not start the print review page: {exc}; "
-                   "set XFOIL_PRINT_PORT to a free port and try again"], **fields)
+    """The response when the queue, its backend or its review page could not be started."""
+    if isinstance(exc, OSError):
+        message = (f"could not start the print review page: {exc}; "
+                   "set XFOIL_PRINT_PORT to a free port and try again")
+    else:
+        message = f"the print setup is invalid: {exc}"
+    return _error("infrastructure", [message], **fields)
+
+def _backend(env, outbox):
+    """The dry run unless XFOIL_PRINT_BACKEND=bambu switches on the real printer.
+
+    Opt-in, so that nothing outside a deliberate setup can reach the printer.
+    ValueError names a bad setting.
+    """
+    from xfoil_mcp.printing import DryBackend
+
+    choice = env.get("XFOIL_PRINT_BACKEND", "dry")
+    if choice == "dry":
+        return DryBackend(outbox)
+    if choice == "bambu":
+        from xfoil_mcp.bambu import PrinterBackend, PrinterConfig
+
+        return PrinterBackend(outbox, PrinterConfig.from_env(env))
+    raise ValueError(f"XFOIL_PRINT_BACKEND is {choice!r}; use 'dry' or 'bambu'")
 
 
 def _find_design(content_hash: str):
@@ -443,8 +462,12 @@ def start_print(request_id: str) -> dict:
     the user to approve it at the url from request_print, then try again.
     An approval is used once and expires after 30 minutes.
 
-    The backend is currently a dry run: it writes the approved STL and a
-    record of the approval to the outbox folder and returns the file's path.
+    With the dry backend (the default) this writes the approved STL and a
+    record of the approval to the outbox folder. With the printer backend
+    it slices the part, uploads it and starts a physical print, then
+    returns the slicer's time and weight estimates and the printer's state.
+    If a send fails, the request is closed: request the print again once
+    the cause is fixed, and the user approves the new request.
     """
     from xfoil_mcp.printing import PrintRefused
 
@@ -459,7 +482,7 @@ def start_print(request_id: str) -> dict:
             status = queue.get(request_id).status
         except PrintRefused:
             status = None
-        return _error("input", [str(exc)], request_id=request_id, print_status=status)
+        return _error(exc.failure_kind, [str(exc)], request_id=request_id, print_status=status)
     return _ok(request_id=request_id, print_status="sent", **sent)
 
 @mcp.tool

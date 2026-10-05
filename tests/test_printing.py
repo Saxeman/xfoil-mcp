@@ -125,6 +125,22 @@ def test_a_backend_failure_fails_the_request_and_says_which_backend(part):
     with pytest.raises(PrintRefused, match="failed; it cannot be printed"):
         queue.start(request.id)                                         # and it stays failed
 
+def test_a_backend_failure_is_an_infrastructure_failure_and_closes_the_request(part):
+    queue = PrintQueue(BrokenBackend())
+    request = queue.create({"label": "x"}, part)
+    queue.approve(request.id, part.sha256)
+    with pytest.raises(PrintRefused) as refused:
+        queue.start(request.id)
+    assert refused.value.failure_kind == "infrastructure"
+    assert "request the print again" in str(refused.value)
+
+def test_a_refused_request_is_still_an_input_failure(part):
+    queue = PrintQueue(BrokenBackend())
+    request = queue.create({"label": "x"}, part)            # never approved
+    with pytest.raises(PrintRefused) as refused:
+        queue.start(request.id)
+    assert refused.value.failure_kind == "input"
+
 
 @pytest.mark.parametrize("first", ["approve", "reject"])
 @pytest.mark.parametrize("second", ["approve", "reject"])

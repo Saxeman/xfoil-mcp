@@ -9,7 +9,7 @@ notes.txt
 useful.txt
 notes/
 outbox/
-.DS_Store/
+.DS_Store
 docs/
 changes.MD
 *.env
